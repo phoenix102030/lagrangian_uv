@@ -15,7 +15,7 @@ K_t^{(ij)}(a,b)
 \propto
 |D_t^{(ij)}|^{-1/2}
 \exp\left(
--
+-1/2
 \left(h_{ab} - d_t^{(ij)}\right)^\top
 \left(D_t^{(ij)}\right)^{-1}
 \left(h_{ab} - d_t^{(ij)}\right)
