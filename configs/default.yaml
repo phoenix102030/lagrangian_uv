@@ -1,0 +1,119 @@
+project:
+  seed: 9527
+  output_dir: ../outputs/stage2_uv_4batchsize
+
+data:
+  site_names: [ E05, E06, ASOW6 ]
+  component_names: [ u, v ]
+
+  measurement:
+    offline_path: ../../wind_ide/data/measurement/wv_h100_180_offline_imputed.mat
+    online_path: ../../wind_ide/data/measurement/wv_h100_180_online_imputed.mat
+    variable_name: Ws_uv
+    target_raw_indices: [ 6, 7, 8, 9, 10, 11 ]
+    component_first_order: [ 0, 2, 4, 1, 3, 5 ]
+
+  nwp:
+    offline_path: ../../wind_ide/data/nwp/data_grid_offline.mat
+    online_path: ../../wind_ide/data/nwp/data_grid_online.mat
+    variable_name: allVariMin_Grid
+    u_channel_indices: [ 6, 8, 10 ]
+    v_channel_indices: [ 7, 9, 11 ]
+    grid_size: [ 40, 40 ]
+    total_channels: 12
+
+  coordinates:
+    manual: null
+    source_path: ../dataset/data_h100_180_offline.mat
+    lat_key: LatValue_vec
+    lon_key: LonValue_vec
+
+  split:
+    train_fraction: 0.8
+
+  windows:
+    window_size: 288
+    stride: 72
+
+  normalization:
+    normalize_observation: true
+    normalize_nwp: true
+    eps: 1e-6
+
+model:
+  num_sites: 3
+  num_components: 2
+  spatial_dim: 2
+  delta_t_hours: 0.1666666667
+  linear_algebra_dtype: float64
+  kernel_jitter: 1e-4
+  transition_jitter: 1e-4
+  cholesky_jitter: 1e-4
+  max_cholesky_tries: 12
+  identity_mix: 0.05
+  min_block_scale: 1e-4
+  mean_scale: 4.0
+  sigma_floor: 1e-3
+  forcing_scale: 2.0
+  persistence_init: 0.98
+  persistence_min: 0.6
+  persistence_max: 1.05
+  residual_init: 0.05
+  residual_max: 0.5
+
+  encoder:
+    hidden_dim: 128
+    dropout: 0.1
+    norm_groups: 8
+    share_encoder: false
+
+covariance:
+  process:
+    init_log_spatial_scale: -0.5
+    init_core_tril: [ 0.10, 0.00, 0.10 ]
+    jitter: 1e-4
+
+  measurement:
+    init_log_spatial_scale: -1
+    init_core_tril: [ 0.05, 0.00, 0.05 ]
+    jitter: 1e-4
+
+  initial_state:
+    init_mean: [ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 ]
+    init_log_diag: [ -1, -1, -1, -1, -1, -1 ]
+    jitter: 1e-4
+
+training:
+  device: cuda
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  epochs: 100
+  learning_rate: 1e-4
+  adam_eps: 1e-6
+  weight_decay: 1e-5
+  gradient_clip_norm: 1.0
+  max_nll_per_timestep: 1e+4
+  nll_weight: 1.0
+  one_step_forecast_weight: 0.5
+  rollout_forecast_weight: 1.0
+  forecast_loss_horizon: 12
+  forecast_loss_min_context: 72
+  max_bad_batches_per_epoch: 100
+  log_every: 1
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  use_ddp: true
+  ddp_backend: nccl
+  find_unused_parameters: false
+  use_data_parallel: false
+  allow_tf32: true
+  cudnn_benchmark: true
+  empty_cache_each_epoch: true
+
+evaluation:
+  context_window: 288
+  forecast_horizon: 12
+  stride: 12
+  max_gif_frames: 120
+  gif_fps: 12
