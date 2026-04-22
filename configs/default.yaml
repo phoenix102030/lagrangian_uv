@@ -98,6 +98,9 @@ training:
   rollout_forecast_weight: 1.0
   forecast_loss_horizon: 12
   forecast_loss_min_context: 72
+  scheduled_sampling_start: 0.8
+  scheduled_sampling_end: 0.1
+  scheduled_sampling_decay_epochs: 40
   max_bad_batches_per_epoch: 100
   log_every: 1
   num_workers: 0

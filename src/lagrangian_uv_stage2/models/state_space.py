@@ -106,6 +106,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         self.rollout_forecast_weight = float(config["training"].get("rollout_forecast_weight", 0.0))
         self.forecast_loss_horizon = int(config["training"].get("forecast_loss_horizon", 0))
         self.forecast_loss_min_context = int(config["training"].get("forecast_loss_min_context", 1))
+        self.scheduled_sampling_ratio = float(config["training"].get("scheduled_sampling_start", 0.0))
 
         self.register_buffer("site_coords", torch.as_tensor(site_coords, dtype=torch.float32))
 
@@ -161,6 +162,9 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 dtype=torch.float32,
             )
         )
+
+    def set_scheduled_sampling_ratio(self, ratio: float) -> None:
+        self.scheduled_sampling_ratio = float(min(max(ratio, 0.0), 1.0))
 
     def _persistence_diagonal(self) -> torch.Tensor:
         return _sigmoid_range(self.persistence_raw, self.persistence_min, self.persistence_max)
@@ -219,6 +223,8 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                     filtered_cov=outputs["filtered_cov"][context_end - 1],
                     future_nwp_u=nwp_u[context_end:],
                     future_nwp_v=nwp_v[context_end:],
+                    teacher_forcing_targets=observations[context_end:],
+                    teacher_forcing_ratio=self.scheduled_sampling_ratio,
                 )
                 rollout_target = observations[context_end:]
                 rollout_loss = torch.nn.functional.smooth_l1_loss(rollout["forecast_mean"], rollout_target)
@@ -416,6 +422,8 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         filtered_cov: torch.Tensor,
         future_nwp_u: torch.Tensor,
         future_nwp_v: torch.Tensor,
+        teacher_forcing_targets: torch.Tensor | None = None,
+        teacher_forcing_ratio: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         advection = self.advection_net(future_nwp_u, future_nwp_v)
         kernel_transition, kernel_aux = self.kernel(
@@ -448,6 +456,15 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             cov_prev = _sanitize_symmetric_matrix(cov_prev)
             forecast_means.append(mean_prev)
             forecast_covs.append(cov_prev)
+            if teacher_forcing_targets is not None and t < dynamics.shape[0] - 1 and teacher_forcing_ratio > 0.0:
+                teacher_state = teacher_forcing_targets[t].to(device=mean_prev.device, dtype=mean_prev.dtype)
+                if teacher_forcing_ratio >= 1.0:
+                    mean_prev = teacher_state
+                else:
+                    teacher_mask = torch.rand((), device=mean_prev.device) < teacher_forcing_ratio
+                    teacher_mask = teacher_mask.to(dtype=mean_prev.dtype)
+                    mean_prev = teacher_mask * teacher_state + (1.0 - teacher_mask) * mean_prev
+                mean_prev = _sanitize_vector(mean_prev)
 
         return {
             "forecast_mean": torch.stack(forecast_means, dim=0).to(dtype=output_dtype),
@@ -471,4 +488,6 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             filtered_cov=filtered_cov,
             future_nwp_u=future_nwp_u,
             future_nwp_v=future_nwp_v,
+            teacher_forcing_targets=None,
+            teacher_forcing_ratio=0.0,
         )

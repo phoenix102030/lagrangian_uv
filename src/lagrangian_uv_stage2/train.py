@@ -101,6 +101,15 @@ def _unwrap_model(model: Stage2LagrangianStateSpaceModel) -> Stage2LagrangianSta
     return model.module if hasattr(model, "module") else model
 
 
+def _scheduled_sampling_ratio(config: dict[str, Any], epoch: int) -> float:
+    training_cfg = config["training"]
+    start = float(training_cfg.get("scheduled_sampling_start", 0.0))
+    end = float(training_cfg.get("scheduled_sampling_end", start))
+    decay_epochs = max(1, int(training_cfg.get("scheduled_sampling_decay_epochs", 1)))
+    progress = min(max((epoch - 1) / decay_epochs, 0.0), 1.0)
+    return start + (end - start) * progress
+
+
 def _first_bad_parameter(model: Stage2LagrangianStateSpaceModel) -> str | None:
     for name, parameter in model.named_parameters():
         if not torch.isfinite(parameter).all():
@@ -249,6 +258,7 @@ def train(config: dict[str, Any]) -> Path:
     try:
         for epoch in range(1, int(config["training"]["epochs"]) + 1):
             model.train()
+            _unwrap_model(model).set_scheduled_sampling_ratio(_scheduled_sampling_ratio(config, epoch))
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
 
