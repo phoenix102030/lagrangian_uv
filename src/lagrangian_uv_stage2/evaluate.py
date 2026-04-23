@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,16 @@ def _json_default(value: Any) -> Any:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
+
+
+def _prepare_export_dir(export_dir: Path) -> None:
+    if export_dir.exists():
+        for child in export_dir.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    export_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _compute_error_metrics(
@@ -123,6 +134,8 @@ def _select_sequence_window(
         dataset = bundle.val_dataset
     elif split == "online":
         sequence = bundle.online_sequence
+        if sequence is None:
+            raise ValueError("Online data was not loaded into this DataBundle, so split='online' is unavailable.")
         sequence_length = int(sequence["obs"].shape[0])
         requested_length = int(online_length or config["evaluation"]["context_window"])
         start = int(online_start)
@@ -170,6 +183,8 @@ def rolling_forecast(
 ) -> dict[str, Any]:
     target_device = torch.device(device)
     sequence = bundle.online_sequence
+    if sequence is None:
+        raise ValueError("Online data was not loaded into this DataBundle, so rolling forecast is unavailable.")
 
     observations = sequence["obs"].to(target_device)
     nwp_u = sequence["nwp_u"].to(target_device)
@@ -602,7 +617,7 @@ def export_window_diagnostics(
     online_length: int | None = None,
 ) -> dict[str, Any]:
     export_dir = Path(export_dir).expanduser().resolve()
-    export_dir.mkdir(parents=True, exist_ok=True)
+    _prepare_export_dir(export_dir)
     target_device = torch.device(device)
 
     observations, nwp_u, nwp_v, metadata = _select_sequence_window(
@@ -697,6 +712,9 @@ def export_window_diagnostics(
         "training_objective": {
             "total_loss": float(_to_numpy(outputs["loss"]).reshape(-1)[0]),
             "negative_log_likelihood": float(_to_numpy(outputs["negative_log_likelihood"]).reshape(-1)[0]),
+            "normalized_negative_log_likelihood": float(
+                _to_numpy(outputs.get("normalized_negative_log_likelihood", outputs["negative_log_likelihood"])).reshape(-1)[0]
+            ),
             "one_step_forecast_loss": float(_to_numpy(outputs["one_step_forecast_loss"]).reshape(-1)[0]),
             "rollout_forecast_loss": float(_to_numpy(outputs["rollout_forecast_loss"]).reshape(-1)[0]),
         },

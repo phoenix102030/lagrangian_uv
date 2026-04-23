@@ -107,6 +107,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         self.forecast_loss_horizon = int(config["training"].get("forecast_loss_horizon", 0))
         self.forecast_loss_min_context = int(config["training"].get("forecast_loss_min_context", 1))
         self.scheduled_sampling_ratio = float(config["training"].get("scheduled_sampling_start", 0.0))
+        self.normalize_nll_by_state_dim = bool(config["training"].get("normalize_nll_by_state_dim", True))
 
         self.register_buffer("site_coords", torch.as_tensor(site_coords, dtype=torch.float32))
 
@@ -207,6 +208,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         device = observations.device
         zero = torch.zeros((), device=device, dtype=output_dtype)
         nll = outputs["negative_log_likelihood"]
+        normalized_nll = nll / float(self.state_dim) if self.normalize_nll_by_state_dim else nll
 
         if observations.shape[0] > 1:
             one_step_loss = torch.nn.functional.smooth_l1_loss(outputs["predicted_mean"][1:], observations[1:])
@@ -230,12 +232,13 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 rollout_loss = torch.nn.functional.smooth_l1_loss(rollout["forecast_mean"], rollout_target)
 
         total_loss = (
-            self.nll_weight * nll
+            self.nll_weight * normalized_nll
             + self.one_step_forecast_weight * one_step_loss
             + self.rollout_forecast_weight * rollout_loss
         )
         return total_loss, {
             "negative_log_likelihood": nll,
+            "normalized_negative_log_likelihood": normalized_nll,
             "one_step_forecast_loss": one_step_loss,
             "rollout_forecast_loss": rollout_loss,
         }

@@ -1,6 +1,6 @@
 project:
   seed: 9527
-  output_dir: ../outputs/stage2_uv_4batchsize
+  output_dir: ../outputs/stage2_uv_02
 
 data:
   site_names: [ E05, E06, ASOW6 ]
@@ -32,8 +32,8 @@ data:
     train_fraction: 0.8
 
   windows:
-    window_size: 288
-    stride: 72
+    window_size: 432
+    stride: 144
 
   normalization:
     normalize_observation: true
@@ -85,7 +85,7 @@ covariance:
 
 training:
   device: cuda
-  batch_size: 4
+  batch_size: 16
   gradient_accumulation_steps: 1
   epochs: 100
   learning_rate: 1e-4
@@ -94,6 +94,7 @@ training:
   gradient_clip_norm: 1.0
   max_nll_per_timestep: 1e+4
   nll_weight: 1.0
+  normalize_nll_by_state_dim: true
   one_step_forecast_weight: 0.5
   rollout_forecast_weight: 1.0
   forecast_loss_horizon: 12
@@ -103,8 +104,8 @@ training:
   scheduled_sampling_decay_epochs: 40
   max_bad_batches_per_epoch: 100
   log_every: 1
-  num_workers: 0
-  pin_memory: false
+  num_workers: 4
+  pin_memory: true
   persistent_workers: false
   use_ddp: true
   ddp_backend: nccl

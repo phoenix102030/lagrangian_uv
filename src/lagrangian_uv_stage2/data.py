@@ -97,7 +97,7 @@ class WindowedSequenceDataset(Dataset):
 class DataBundle:
     train_dataset: WindowedSequenceDataset
     val_dataset: WindowedSequenceDataset
-    online_sequence: dict[str, torch.Tensor]
+    online_sequence: dict[str, torch.Tensor] | None
     obs_scaler: Standardizer
     nwp_u_scaler: Standardizer
     nwp_v_scaler: Standardizer
@@ -201,14 +201,22 @@ def _build_feature_names(config: dict[str, Any]) -> list[str]:
     return [f"{component}_{site}_140m" for component in component_names for site in site_names]
 
 
-def build_data_bundle(config: dict[str, Any], scaler_state: dict[str, dict[str, list]] | None = None) -> DataBundle:
+def build_data_bundle(
+    config: dict[str, Any],
+    scaler_state: dict[str, dict[str, list]] | None = None,
+    include_online: bool = True,
+) -> DataBundle:
     obs_offline = _select_measurement_block(config, "offline")
     nwp_u_offline, nwp_v_offline = _select_nwp_blocks(config, "offline")
     obs_offline, nwp_u_offline, nwp_v_offline = _align_lengths(obs_offline, nwp_u_offline, nwp_v_offline)
 
-    obs_online = _select_measurement_block(config, "online")
-    nwp_u_online, nwp_v_online = _select_nwp_blocks(config, "online")
-    obs_online, nwp_u_online, nwp_v_online = _align_lengths(obs_online, nwp_u_online, nwp_v_online)
+    obs_online: np.ndarray | None = None
+    nwp_u_online: np.ndarray | None = None
+    nwp_v_online: np.ndarray | None = None
+    if include_online:
+        obs_online = _select_measurement_block(config, "online")
+        nwp_u_online, nwp_v_online = _select_nwp_blocks(config, "online")
+        obs_online, nwp_u_online, nwp_v_online = _align_lengths(obs_online, nwp_u_online, nwp_v_online)
 
     split_fraction = float(config["data"]["split"]["train_fraction"])
     split_index = int(len(obs_offline) * split_fraction)
@@ -245,9 +253,16 @@ def build_data_bundle(config: dict[str, Any], scaler_state: dict[str, dict[str, 
     nwp_u_offline = nwp_u_scaler.transform(nwp_u_offline)
     nwp_v_offline = nwp_v_scaler.transform(nwp_v_offline)
 
-    obs_online = obs_scaler.transform(obs_online)
-    nwp_u_online = nwp_u_scaler.transform(nwp_u_online)
-    nwp_v_online = nwp_v_scaler.transform(nwp_v_online)
+    online_sequence: dict[str, torch.Tensor] | None = None
+    if include_online and obs_online is not None and nwp_u_online is not None and nwp_v_online is not None:
+        obs_online = obs_scaler.transform(obs_online)
+        nwp_u_online = nwp_u_scaler.transform(nwp_u_online)
+        nwp_v_online = nwp_v_scaler.transform(nwp_v_online)
+        online_sequence = {
+            "obs": torch.from_numpy(obs_online).float(),
+            "nwp_u": torch.from_numpy(nwp_u_online).float(),
+            "nwp_v": torch.from_numpy(nwp_v_online).float(),
+        }
 
     window_cfg = config["data"]["windows"]
     train_dataset = WindowedSequenceDataset(
@@ -264,12 +279,6 @@ def build_data_bundle(config: dict[str, Any], scaler_state: dict[str, dict[str, 
         window_size=int(window_cfg["window_size"]),
         stride=int(window_cfg["stride"]),
     )
-
-    online_sequence = {
-        "obs": torch.from_numpy(obs_online).float(),
-        "nwp_u": torch.from_numpy(nwp_u_online).float(),
-        "nwp_v": torch.from_numpy(nwp_v_online).float(),
-    }
 
     return DataBundle(
         train_dataset=train_dataset,

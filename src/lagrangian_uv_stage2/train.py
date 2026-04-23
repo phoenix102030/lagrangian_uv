@@ -145,7 +145,7 @@ def _evaluate_loader(
 def train(config: dict[str, Any]) -> Path:
     context = _init_distributed(config)
     _set_seed(int(config["project"]["seed"]) + context.rank)
-    bundle = build_data_bundle(config)
+    bundle = build_data_bundle(config, include_online=False)
     per_gpu_batch_size = int(config["training"]["batch_size"])
     accumulation_steps = max(1, int(config["training"].get("gradient_accumulation_steps", 1)))
     global_batch_size = per_gpu_batch_size * context.world_size
