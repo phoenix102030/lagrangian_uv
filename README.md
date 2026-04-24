@@ -1,3 +1,5 @@
+python scripts/train.py --config configs/joint_uv.yaml
+
 python -m scripts.export_diagnostics \
   --config configs/default.yaml \
   --checkpoint outputs/stage2_uv_02/best.pt \

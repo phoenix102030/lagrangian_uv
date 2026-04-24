@@ -29,11 +29,12 @@ def _raw_to_spd(raw: torch.Tensor, matrix_dim: int, sigma_floor: float) -> torch
 
     diag_idx = torch.arange(matrix_dim, device=raw.device)
     diag_param_idx = torch.cumsum(torch.arange(1, matrix_dim + 1, device=raw.device), dim=0) - 1
-    chol[..., diag_idx, diag_idx] = F.softplus(raw[..., diag_param_idx]) + sigma_floor
+    sigma_floor_tensor = raw.new_tensor(sigma_floor)
+    chol[..., diag_idx, diag_idx] = F.softplus(raw[..., diag_param_idx]) + sigma_floor_tensor
     covariance = chol @ chol.transpose(-1, -2)
     covariance = _sanitize_tensor(covariance)
     eye = torch.eye(matrix_dim, device=raw.device, dtype=raw.dtype)
-    return covariance + sigma_floor * eye
+    return covariance + sigma_floor_tensor * eye
 
 
 def _raw_to_spd_2x2(raw: torch.Tensor, sigma_floor: float) -> torch.Tensor:
