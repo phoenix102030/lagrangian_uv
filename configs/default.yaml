@@ -27,13 +27,16 @@ data:
     source_path: ../dataset/data_h100_180_offline.mat
     lat_key: LatValue_vec
     lon_key: LonValue_vec
+    order: lat_lon
+    convert_to_local_km: true
+    local_km_scale: 50.0
 
   split:
     train_fraction: 0.8
 
   windows:
-    window_size: 432
-    stride: 144
+    window_size: 288
+    stride: 72
 
   normalization:
     normalize_observation: true
@@ -45,28 +48,33 @@ model:
   num_components: 2
   spatial_dim: 2
   delta_t_hours: 0.1666666667
-  linear_algebra_dtype: float64
+  linear_algebra_dtype: float32
   kernel_jitter: 1e-4
   transition_jitter: 1e-4
   cholesky_jitter: 1e-4
   max_cholesky_tries: 12
-  identity_mix: 0.05
+  identity_mix: 0.0
   min_block_scale: 1e-4
-  mean_scale: 4.0
+  allow_cross_component: false
+  shared_component_advection: true
+  diagonal_block_scale_init: 1.0
+  cross_component_scale_init: 0.02
+  mean_scale: 2.0
   sigma_floor: 1e-3
-  forcing_scale: 2.0
-  persistence_init: 0.9
-  persistence_min: 0.6
+  forcing_scale: 0.0
+  persistence_init: 0.2
+  persistence_min: 0.0
   persistence_max: 0.98
-  kernel_mix_init: 0.7
-  kernel_mix_min: 0.35
+  kernel_mix_init: 0.95
+  kernel_mix_min: 0.70
   kernel_mix_max: 1.0
 
   encoder:
-    hidden_dim: 128
+    hidden_dim: 64
     dropout: 0.1
     norm_groups: 8
-    share_encoder: false
+    share_encoder: true
+    temporal_model: gru
 
 covariance:
   process:
@@ -86,28 +94,32 @@ covariance:
 
 training:
   device: cuda
-  batch_size: 4
-  gradient_accumulation_steps: 4
+  batch_size: 2
+  gradient_accumulation_steps: 8
   epochs: 100
   learning_rate: 1e-4
   adam_eps: 1e-6
   weight_decay: 1e-5
   gradient_clip_norm: 1.0
   max_nll_per_timestep: 1e+4
-  nll_weight: 1.0
+  nll_weight: 0.2
   normalize_nll_by_state_dim: true
-  one_step_forecast_weight: 0.5
+  one_step_forecast_weight: 1.0
   rollout_forecast_weight: 1.0
+  kernel_one_step_weight: 1.0
   forecast_loss_horizon: 12
   forecast_loss_min_context: 72
-  scheduled_sampling_start: 0.8
-  scheduled_sampling_end: 0.1
+  scheduled_sampling_start: 0.5
+  scheduled_sampling_end: 0.0
   scheduled_sampling_decay_epochs: 40
   max_bad_batches_per_epoch: 100
   log_every: 1
-  num_workers: 4
-  pin_memory: true
+  num_workers: 1
+  prefetch_factor: 1
+  pin_memory: false
   persistent_workers: false
+  use_amp: true
+  amp_dtype: float16
   use_ddp: true
   ddp_backend: nccl
   find_unused_parameters: false

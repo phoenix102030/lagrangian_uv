@@ -105,6 +105,8 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         self.nll_weight = float(config["training"].get("nll_weight", 1.0))
         self.one_step_forecast_weight = float(config["training"].get("one_step_forecast_weight", 0.0))
         self.rollout_forecast_weight = float(config["training"].get("rollout_forecast_weight", 0.0))
+        self.kernel_one_step_weight = float(config["training"].get("kernel_one_step_weight", 0.0))
+        self.shared_component_advection = bool(model_cfg.get("shared_component_advection", True))
         self.forecast_loss_horizon = int(config["training"].get("forecast_loss_horizon", 0))
         self.forecast_loss_min_context = int(config["training"].get("forecast_loss_min_context", 1))
         self.scheduled_sampling_ratio = float(config["training"].get("scheduled_sampling_start", 0.0))
@@ -122,7 +124,8 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             sigma_floor=float(model_cfg["sigma_floor"]),
             share_encoder=bool(encoder_cfg["share_encoder"]),
             state_dim=self.state_dim,
-            forcing_scale=float(model_cfg.get("forcing_scale", 2.0)),
+            forcing_scale=float(model_cfg.get("forcing_scale", 0.0)),
+            temporal_model=str(encoder_cfg.get("temporal_model", "gru")),
         )
         self.kernel = StochasticAdvectionKernel(
             num_sites=self.num_sites,
@@ -131,6 +134,9 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             kernel_jitter=float(model_cfg["kernel_jitter"]),
             identity_mix=float(model_cfg["identity_mix"]),
             min_block_scale=float(model_cfg["min_block_scale"]),
+            allow_cross_component=bool(model_cfg.get("allow_cross_component", False)),
+            diagonal_block_scale_init=float(model_cfg.get("diagonal_block_scale_init", 1.0)),
+            cross_component_scale_init=float(model_cfg.get("cross_component_scale_init", 0.02)),
         )
         self.process_covariance = SeparableCrossCovariance(
             init_core_tril=cov_cfg["process"]["init_core_tril"],
@@ -173,6 +179,19 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
 
     def _kernel_mix(self) -> torch.Tensor:
         return _sigmoid_range(self.residual_gate_raw, self.kernel_mix_min, self.kernel_mix_max)
+
+    def _apply_advection_constraints(self, advection: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if not self.shared_component_advection:
+            return advection
+
+        shared_mean = advection["means"].mean(dim=1, keepdim=True)
+        shared_covariance = advection["covariances"].mean(dim=1, keepdim=True)
+        constrained = dict(advection)
+        constrained["component_raw_means"] = advection["means"]
+        constrained["component_raw_covariances"] = advection["covariances"]
+        constrained["means"] = shared_mean.expand(-1, self.num_components, -1)
+        constrained["covariances"] = shared_covariance.expand(-1, self.num_components, -1, -1)
+        return constrained
 
     def _build_dynamics(
         self,
@@ -218,6 +237,15 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         else:
             one_step_loss = zero
 
+        kernel_one_step_loss = zero
+        if self.kernel_one_step_weight > 0.0 and observations.shape[0] > 1 and "kernel_transition" in outputs:
+            kernel_prediction = torch.einsum(
+                "tij,tj->ti",
+                outputs["kernel_transition"][1:].to(dtype=observations.dtype),
+                observations[:-1],
+            )
+            kernel_one_step_loss = torch.nn.functional.smooth_l1_loss(kernel_prediction, observations[1:])
+
         rollout_loss = zero
         rollout_horizon = min(self.forecast_loss_horizon, max(observations.shape[0] - self.forecast_loss_min_context, 0))
         if self.rollout_forecast_weight > 0.0 and rollout_horizon > 0:
@@ -229,7 +257,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                     future_nwp_u=nwp_u[context_end:],
                     future_nwp_v=nwp_v[context_end:],
                     teacher_forcing_targets=observations[context_end:],
-                    teacher_forcing_ratio=self.scheduled_sampling_ratio,
+                    teacher_forcing_ratio=self.scheduled_sampling_ratio if self.training else 0.0,
                 )
                 rollout_target = observations[context_end:]
                 rollout_loss = torch.nn.functional.smooth_l1_loss(rollout["forecast_mean"], rollout_target)
@@ -238,12 +266,14 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             self.nll_weight * normalized_nll
             + self.one_step_forecast_weight * one_step_loss
             + self.rollout_forecast_weight * rollout_loss
+            + self.kernel_one_step_weight * kernel_one_step_loss
         )
         return total_loss, {
             "negative_log_likelihood": nll,
             "normalized_negative_log_likelihood": normalized_nll,
             "one_step_forecast_loss": one_step_loss,
             "rollout_forecast_loss": rollout_loss,
+            "kernel_one_step_loss": kernel_one_step_loss,
         }
 
     def _forward_single(
@@ -252,7 +282,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         nwp_u: torch.Tensor,
         nwp_v: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        advection = self.advection_net(nwp_u, nwp_v)
+        advection = self._apply_advection_constraints(self.advection_net(nwp_u, nwp_v))
         kernel_transition, kernel_aux = self.kernel(
             means=advection["means"],
             covariances=advection["covariances"],
@@ -296,6 +326,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             negative_log_likelihoods = []
             one_step_losses = []
             rollout_losses = []
+            kernel_one_step_losses = []
             for batch_idx in range(observations.shape[0]):
                 outputs = self._forward_single(
                     observations=observations[batch_idx],
@@ -306,12 +337,14 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 negative_log_likelihoods.append(outputs["negative_log_likelihood"])
                 one_step_losses.append(outputs["one_step_forecast_loss"])
                 rollout_losses.append(outputs["rollout_forecast_loss"])
+                kernel_one_step_losses.append(outputs["kernel_one_step_loss"])
 
             return {
                 "loss": torch.stack(losses, dim=0).mean(),
                 "negative_log_likelihood": torch.stack(negative_log_likelihoods, dim=0).mean(),
                 "one_step_forecast_loss": torch.stack(one_step_losses, dim=0).mean(),
                 "rollout_forecast_loss": torch.stack(rollout_losses, dim=0).mean(),
+                "kernel_one_step_loss": torch.stack(kernel_one_step_losses, dim=0).mean(),
             }
 
         raise ValueError(
@@ -431,7 +464,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         teacher_forcing_targets: torch.Tensor | None = None,
         teacher_forcing_ratio: float = 0.0,
     ) -> dict[str, torch.Tensor]:
-        advection = self.advection_net(future_nwp_u, future_nwp_v)
+        advection = self._apply_advection_constraints(self.advection_net(future_nwp_u, future_nwp_v))
         kernel_transition, kernel_aux = self.kernel(
             means=advection["means"],
             covariances=advection["covariances"],

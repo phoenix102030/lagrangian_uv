@@ -305,6 +305,42 @@ def _flatten_station_vector(array: np.ndarray, expected_sites: int) -> np.ndarra
     return vector
 
 
+def _lat_lon_to_local_km(coords_lat_lon: np.ndarray) -> np.ndarray:
+    coords_lat_lon = np.asarray(coords_lat_lon, dtype=np.float32)
+    if coords_lat_lon.ndim != 2 or coords_lat_lon.shape[1] != 2:
+        raise ValueError(f"Expected [num_sites, 2] latitude/longitude coordinates, got {coords_lat_lon.shape}.")
+
+    lat = coords_lat_lon[:, 0]
+    lon = coords_lat_lon[:, 1]
+    lat0 = float(lat.mean())
+    lon0 = float(lon.mean())
+    km_per_degree_lat = 111.32
+    km_per_degree_lon = km_per_degree_lat * np.cos(np.deg2rad(lat0))
+    x = (lon - lon0) * km_per_degree_lon
+    y = (lat - lat0) * km_per_degree_lat
+    return np.stack([x, y], axis=-1).astype(np.float32)
+
+
+def _maybe_convert_coords_to_local_km(coords: np.ndarray, coord_cfg: dict[str, Any]) -> np.ndarray:
+    if not bool(coord_cfg.get("convert_to_local_km", True)):
+        return np.asarray(coords, dtype=np.float32)
+
+    order = str(coord_cfg.get("order", "lat_lon")).lower()
+    coords = np.asarray(coords, dtype=np.float32)
+    if order == "lat_lon":
+        lat_lon = coords
+    elif order == "lon_lat":
+        lat_lon = coords[:, [1, 0]]
+    else:
+        raise ValueError("data.coordinates.order must be 'lat_lon' or 'lon_lat'.")
+
+    local_km = _lat_lon_to_local_km(lat_lon)
+    scale_km = float(coord_cfg.get("local_km_scale", 50.0))
+    if scale_km <= 0.0:
+        raise ValueError("data.coordinates.local_km_scale must be positive.")
+    return (local_km / scale_km).astype(np.float32)
+
+
 def _load_site_coords(config: dict[str, Any]) -> np.ndarray:
     coord_cfg = config["data"]["coordinates"]
     num_sites = int(config["model"]["num_sites"])
@@ -315,11 +351,11 @@ def _load_site_coords(config: dict[str, Any]) -> np.ndarray:
             raise ValueError(
                 f"Manual station coordinates must have shape {(num_sites, 2)}, got {coords.shape}."
             )
-        return coords
+        return _maybe_convert_coords_to_local_km(coords, coord_cfg)
 
     lat = _flatten_station_vector(load_mat_variable(coord_cfg["source_path"], coord_cfg["lat_key"]), num_sites)
     lon = _flatten_station_vector(load_mat_variable(coord_cfg["source_path"], coord_cfg["lon_key"]), num_sites)
-    return np.stack([lat, lon], axis=-1)
+    return _maybe_convert_coords_to_local_km(np.stack([lat, lon], axis=-1), coord_cfg)
 
 
 def _select_measurement_block(config: dict[str, Any], subset: str) -> np.ndarray:

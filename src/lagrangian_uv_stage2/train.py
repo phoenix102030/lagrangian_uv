@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -86,6 +87,43 @@ def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> tuple[
     return obs, nwp_u, nwp_v
 
 
+def _autocast_context(device: torch.device, enabled: bool, dtype_name: str):
+    if not enabled:
+        return nullcontext()
+    dtype_lookup = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    dtype = dtype_lookup.get(dtype_name.lower())
+    if dtype is None:
+        raise ValueError("training.amp_dtype must be one of: float16, fp16, bfloat16, bf16")
+    return torch.autocast(device_type=device.type, dtype=dtype, enabled=True)
+
+
+def _make_grad_scaler(device: torch.device, enabled: bool):
+    if not enabled:
+        return None
+    try:
+        return torch.amp.GradScaler(device.type, enabled=True)
+    except TypeError:  # pragma: no cover - compatibility with older PyTorch
+        return torch.cuda.amp.GradScaler(enabled=True)
+
+
+def _loader_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    training_cfg = config["training"]
+    num_workers = int(training_cfg["num_workers"])
+    kwargs: dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": bool(training_cfg.get("pin_memory", False)),
+        "persistent_workers": bool(training_cfg.get("persistent_workers", False)) and num_workers > 0,
+    }
+    if num_workers > 0 and "prefetch_factor" in training_cfg:
+        kwargs["prefetch_factor"] = int(training_cfg.get("prefetch_factor", 1))
+    return kwargs
+
+
 def _compute_batch_loss(
     model: Stage2LagrangianStateSpaceModel,
     batch: dict[str, Any],
@@ -129,13 +167,16 @@ def _evaluate_loader(
     loader: DataLoader,
     device: torch.device,
     context: DistributedContext,
+    amp_enabled: bool = False,
+    amp_dtype: str = "float16",
 ) -> float:
     model.eval()
     local_loss_sum = 0.0
     local_loss_count = 0
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in loader:
-            loss = _compute_batch_loss(model, batch, device)
+            with _autocast_context(device, amp_enabled, amp_dtype):
+                loss = _compute_batch_loss(model, batch, device)
             if torch.isfinite(loss):
                 local_loss_sum += float(loss.detach().cpu())
                 local_loss_count += 1
@@ -164,6 +205,10 @@ def train(config: dict[str, Any]) -> Path:
             torch.backends.cudnn.allow_tf32 = True
         if bool(config["training"].get("cudnn_benchmark", True)):
             torch.backends.cudnn.benchmark = True
+
+    amp_enabled = bool(config["training"].get("use_amp", False)) and device.type == "cuda"
+    amp_dtype = str(config["training"].get("amp_dtype", "float16"))
+    grad_scaler = _make_grad_scaler(device, amp_enabled)
 
     model = Stage2LagrangianStateSpaceModel(config, site_coords=bundle.site_coords).to(device)
     if context.enabled:
@@ -236,20 +281,14 @@ def train(config: dict[str, Any]) -> Path:
         batch_size=int(config["training"]["batch_size"]),
         shuffle=train_sampler is None,
         sampler=train_sampler,
-        num_workers=int(config["training"]["num_workers"]),
-        pin_memory=bool(config["training"].get("pin_memory", False)),
-        persistent_workers=bool(config["training"].get("persistent_workers", False))
-        and int(config["training"]["num_workers"]) > 0,
+        **_loader_kwargs(config),
     )
     val_loader = DataLoader(
         bundle.val_dataset,
         batch_size=int(config["training"]["batch_size"]),
         shuffle=False,
         sampler=val_sampler,
-        num_workers=int(config["training"]["num_workers"]),
-        pin_memory=bool(config["training"].get("pin_memory", False)),
-        persistent_workers=bool(config["training"].get("persistent_workers", False))
-        and int(config["training"]["num_workers"]) > 0,
+        **_loader_kwargs(config),
     )
 
     output_dir = Path(config["project"]["output_dir"]).resolve()
@@ -273,40 +312,61 @@ def train(config: dict[str, Any]) -> Path:
             optimizer.zero_grad(set_to_none=True)
 
             for batch_index, batch in enumerate(train_loader, start=1):
-                loss = _compute_batch_loss(model, batch, device)
-
-                skip_loss = _distributed_any(not torch.isfinite(loss), device, context)
-                if skip_loss:
-                    bad_batch_count += 1
-                    if _is_main_process(context):
-                        start_index = batch["start_index"][0] if isinstance(batch["start_index"], torch.Tensor) else batch["start_index"]
-                        print(f"Skipping non-finite loss at epoch={epoch} start_index={int(start_index)}")
-                    optimizer.zero_grad(set_to_none=True)
-                    if bad_batch_count > int(config["training"].get("max_bad_batches_per_epoch", 100)):
-                        raise RuntimeError("Too many non-finite batches in one epoch.")
-                    continue
-
-                (loss / accumulation_steps).backward()
-
-                bad_grad_name = _first_bad_gradient(_unwrap_model(model))
-                skip_grad = _distributed_any(bad_grad_name is not None, device, context)
-                if skip_grad:
-                    bad_batch_count += 1
-                    if _is_main_process(context):
-                        print("Skipping optimizer step due to non-finite gradient on at least one rank.")
-                    optimizer.zero_grad(set_to_none=True)
-                    if bad_batch_count > int(config["training"].get("max_bad_batches_per_epoch", 100)):
-                        raise RuntimeError("Too many non-finite batches in one epoch.")
-                    continue
-
                 should_step = (batch_index % accumulation_steps == 0) or (batch_index == len(train_loader))
+                sync_context = (
+                    model.no_sync()
+                    if context.enabled and accumulation_steps > 1 and not should_step
+                    else nullcontext()
+                )
+
+                with sync_context:
+                    with _autocast_context(device, amp_enabled, amp_dtype):
+                        loss = _compute_batch_loss(model, batch, device)
+
+                    skip_loss = _distributed_any(not torch.isfinite(loss), device, context)
+                    if skip_loss:
+                        bad_batch_count += 1
+                        if _is_main_process(context):
+                            start_index = batch["start_index"][0] if isinstance(batch["start_index"], torch.Tensor) else batch["start_index"]
+                            print(f"Skipping non-finite loss at epoch={epoch} start_index={int(start_index)}")
+                        optimizer.zero_grad(set_to_none=True)
+                        if bad_batch_count > int(config["training"].get("max_bad_batches_per_epoch", 100)):
+                            raise RuntimeError("Too many non-finite batches in one epoch.")
+                        continue
+
+                    scaled_loss = loss / accumulation_steps
+                    if grad_scaler is not None:
+                        grad_scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
+
                 if should_step:
+                    if grad_scaler is not None:
+                        grad_scaler.unscale_(optimizer)
+
+                    bad_grad_name = _first_bad_gradient(_unwrap_model(model))
+                    skip_grad = _distributed_any(bad_grad_name is not None, device, context)
+                    if skip_grad:
+                        bad_batch_count += 1
+                        if _is_main_process(context):
+                            print("Skipping optimizer step due to non-finite gradient on at least one rank.")
+                        optimizer.zero_grad(set_to_none=True)
+                        if grad_scaler is not None:
+                            grad_scaler.update()
+                        if bad_batch_count > int(config["training"].get("max_bad_batches_per_epoch", 100)):
+                            raise RuntimeError("Too many non-finite batches in one epoch.")
+                        continue
+
                     clip_grad_norm_(
                         model.parameters(),
                         max_norm=float(config["training"]["gradient_clip_norm"]),
                         error_if_nonfinite=False,
                     )
-                    optimizer.step()
+                    if grad_scaler is not None:
+                        grad_scaler.step(optimizer)
+                        grad_scaler.update()
+                    else:
+                        optimizer.step()
 
                     bad_param_name = _first_bad_parameter(_unwrap_model(model))
                     skip_param = _distributed_any(bad_param_name is not None, device, context)
@@ -325,7 +385,7 @@ def train(config: dict[str, Any]) -> Path:
 
             train_loss = _distributed_mean(local_loss_sum, local_loss_count, device, context)
             val_loss = (
-                _evaluate_loader(model, val_loader, device, context)
+                _evaluate_loader(model, val_loader, device, context, amp_enabled, amp_dtype)
                 if len(bundle.val_dataset) > 0
                 else float("nan")
             )

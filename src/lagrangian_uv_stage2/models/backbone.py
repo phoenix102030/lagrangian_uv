@@ -78,9 +78,23 @@ class ComponentAdvectionHead(nn.Module):
         dropout: float,
         mean_scale: float,
         sigma_floor: float,
+        temporal_model: str = "gru",
     ) -> None:
         super().__init__()
         self.encoder = encoder
+        self.temporal_model = temporal_model.lower()
+        if self.temporal_model == "gru":
+            self.temporal = nn.GRU(
+                input_size=hidden_dim,
+                hidden_size=hidden_dim,
+                num_layers=1,
+                batch_first=True,
+            )
+        elif self.temporal_model in {"none", "identity"}:
+            self.temporal = None
+        else:
+            raise ValueError("model.encoder.temporal_model must be 'gru' or 'none'.")
+
         self.hidden = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -91,8 +105,17 @@ class ComponentAdvectionHead(nn.Module):
         self.mean_scale = mean_scale
         self.sigma_floor = sigma_floor
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _encode_sequence(self, x: torch.Tensor) -> torch.Tensor:
         encoded = self.encoder(x)
+        if self.temporal is None:
+            return encoded
+        if encoded.ndim != 2:
+            raise ValueError(f"Temporal advection head expects encoded shape [time, hidden], got {encoded.shape}.")
+        smoothed, _ = self.temporal(encoded.unsqueeze(0))
+        return _sanitize_tensor(smoothed.squeeze(0))
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        encoded = self._encode_sequence(x)
         hidden = _sanitize_tensor(self.hidden(encoded))
         mean = torch.tanh(_sanitize_tensor(self.mean_head(hidden))) * self.mean_scale
         covariance = _raw_to_spd_2x2(self.cov_head(hidden), self.sigma_floor)
@@ -113,6 +136,7 @@ class DualBranchAdvectionNet(nn.Module):
         share_encoder: bool,
         state_dim: int,
         forcing_scale: float,
+        temporal_model: str = "gru",
     ) -> None:
         super().__init__()
 
@@ -130,6 +154,7 @@ class DualBranchAdvectionNet(nn.Module):
             dropout=dropout,
             mean_scale=mean_scale,
             sigma_floor=sigma_floor,
+            temporal_model=temporal_model,
         )
         self.v_head = ComponentAdvectionHead(
             encoder=v_encoder,
@@ -137,6 +162,7 @@ class DualBranchAdvectionNet(nn.Module):
             dropout=dropout,
             mean_scale=mean_scale,
             sigma_floor=sigma_floor,
+            temporal_model=temporal_model,
         )
         self.forcing_head = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim),
@@ -144,7 +170,8 @@ class DualBranchAdvectionNet(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, state_dim),
         )
-        self.forcing_scale = forcing_scale
+        self.forcing_scale = float(forcing_scale)
+        self.state_dim = int(state_dim)
 
     def forward(self, nwp_u: torch.Tensor, nwp_v: torch.Tensor) -> dict[str, torch.Tensor]:
         mean_u, cov_u, feat_u = self.u_head(nwp_u)
@@ -152,7 +179,16 @@ class DualBranchAdvectionNet(nn.Module):
         means = torch.stack([mean_u, mean_v], dim=1)
         covariances = torch.stack([cov_u, cov_v], dim=1)
         features = torch.stack([feat_u, feat_v], dim=1)
-        forcing_features = torch.cat([feat_u, feat_v], dim=-1)
-        forcing = torch.tanh(_sanitize_tensor(self.forcing_head(forcing_features))) * self.forcing_scale
-        forcing = _sanitize_tensor(forcing)
+
+        if self.forcing_scale <= 0.0:
+            forcing = torch.zeros(
+                (nwp_u.shape[0], self.state_dim),
+                device=nwp_u.device,
+                dtype=feat_u.dtype,
+            )
+        else:
+            forcing_features = torch.cat([feat_u, feat_v], dim=-1)
+            forcing = torch.tanh(_sanitize_tensor(self.forcing_head(forcing_features))) * self.forcing_scale
+            forcing = _sanitize_tensor(forcing)
+
         return {"means": means, "covariances": covariances, "features": features, "forcing": forcing}

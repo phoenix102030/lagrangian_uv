@@ -22,6 +22,13 @@ def _sanitize_matrix(matrix: torch.Tensor, finite_clip: float = 1.0e4) -> torch.
     return _symmetrize(matrix)
 
 
+def _softplus_inverse(value: float) -> float:
+    value = max(float(value), 1.0e-8)
+    if value > 20.0:
+        return value
+    return math.log(math.expm1(value))
+
+
 def _stable_inverse_logdet(
     matrix: torch.Tensor,
     base_jitter: float,
@@ -57,6 +64,15 @@ def _stable_inverse_logdet(
 
 
 class StochasticAdvectionKernel(nn.Module):
+    """Build the theorem-inspired redistribution matrix.
+
+    The same-component block must not use ``mu_i - mu_i``. For a component
+    propagated to itself, Theorem 2' has a shifted kernel with drift
+    ``dt * mu_i`` and dispersion ``I + 2 * dt**2 * Sigma_i``. The older
+    implementation made the dominant u->u and v->v paths zero-drift, so the
+    advection net had almost no identifiable transport signal to learn.
+    """
+
     def __init__(
         self,
         num_sites: int,
@@ -65,17 +81,30 @@ class StochasticAdvectionKernel(nn.Module):
         kernel_jitter: float,
         identity_mix: float,
         min_block_scale: float,
+        allow_cross_component: bool = False,
+        diagonal_block_scale_init: float = 1.0,
+        cross_component_scale_init: float = 0.02,
     ) -> None:
         super().__init__()
-        self.num_sites = num_sites
-        self.num_components = num_components
-        self.delta_t = delta_t
-        self.kernel_jitter = kernel_jitter
-        self.min_block_scale = min_block_scale
+        self.num_sites = int(num_sites)
+        self.num_components = int(num_components)
+        self.delta_t = float(delta_t)
+        self.kernel_jitter = float(kernel_jitter)
+        self.min_block_scale = float(min_block_scale)
+        self.allow_cross_component = bool(allow_cross_component)
 
-        init_scale = torch.full((num_components, num_components), 0.25, dtype=torch.float32)
-        init_scale.fill_diagonal_(1.0)
-        self.block_scale_raw = nn.Parameter(init_scale)
+        scale_init = torch.full(
+            (self.num_components, self.num_components),
+            _softplus_inverse(cross_component_scale_init),
+            dtype=torch.float32,
+        )
+        scale_init.fill_diagonal_(_softplus_inverse(diagonal_block_scale_init))
+        self.block_scale_raw = nn.Parameter(scale_init)
+
+        component_mask = torch.eye(self.num_components, dtype=torch.float32)
+        if self.allow_cross_component:
+            component_mask = torch.ones((self.num_components, self.num_components), dtype=torch.float32)
+        self.register_buffer("component_mask", component_mask)
 
         clipped_mix = min(max(identity_mix, 1.0e-6), 1.0 - 1.0e-6)
         self.identity_mix_logit = nn.Parameter(
@@ -88,6 +117,25 @@ class StochasticAdvectionKernel(nn.Module):
     def _identity_mix(self) -> torch.Tensor:
         return torch.sigmoid(self.identity_mix_logit)
 
+    def _block_drift_dispersion(
+        self,
+        mean_i: torch.Tensor,
+        mean_j: torch.Tensor,
+        cov_i: torch.Tensor,
+        cov_j: torch.Tensor,
+        same_component: bool,
+        eye2: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if same_component:
+            drift = self.delta_t * mean_i
+            dispersion = eye2 + 2.0 * (self.delta_t**2) * cov_i
+        else:
+            drift = self.delta_t * (mean_i - mean_j)
+            dispersion = eye2 + 2.0 * (self.delta_t**2) * (cov_i + cov_j)
+        drift = _sanitize_vector(drift)
+        dispersion = _sanitize_matrix(dispersion + self.kernel_jitter * eye2)
+        return drift, dispersion
+
     def forward(
         self,
         means: torch.Tensor,
@@ -99,6 +147,7 @@ class StochasticAdvectionKernel(nn.Module):
         covariances = _sanitize_matrix(covariances)
         spatial_lags = _sanitize_vector(site_coords.unsqueeze(1) - site_coords.unsqueeze(0))
         block_scales = self._block_scales().to(means.device, means.dtype)
+        component_mask = self.component_mask.to(means.device, means.dtype)
         identity_mix = self._identity_mix().to(means.device, means.dtype)
         eye2 = torch.eye(2, device=means.device, dtype=means.dtype)
 
@@ -118,10 +167,14 @@ class StochasticAdvectionKernel(nn.Module):
                 row_dispersion = []
 
                 for j in range(self.num_components):
-                    drift = self.delta_t * (means[t, i] - means[t, j])
-                    drift = _sanitize_vector(drift)
-                    dispersion = eye2 + 2.0 * (self.delta_t**2) * (covariances[t, i] + covariances[t, j])
-                    dispersion = _sanitize_matrix(dispersion + self.kernel_jitter * eye2)
+                    drift, dispersion = self._block_drift_dispersion(
+                        mean_i=means[t, i],
+                        mean_j=means[t, j],
+                        cov_i=covariances[t, i],
+                        cov_j=covariances[t, j],
+                        same_component=(i == j),
+                        eye2=eye2,
+                    )
                     dispersion, inv_dispersion, log_det = _stable_inverse_logdet(
                         dispersion,
                         base_jitter=self.kernel_jitter,
@@ -132,7 +185,7 @@ class StochasticAdvectionKernel(nn.Module):
                     quad_form = torch.nan_to_num(quad_form, nan=0.0, posinf=60.0, neginf=0.0)
                     quad_form = torch.clamp(quad_form, min=0.0, max=60.0)
                     exponent = torch.clamp(-0.5 * log_det - quad_form, min=-60.0, max=20.0)
-                    block = block_scales[i, j] * torch.exp(exponent)
+                    block = component_mask[i, j] * block_scales[i, j] * torch.exp(exponent)
                     block = torch.nan_to_num(block, nan=0.0, posinf=0.0, neginf=0.0)
 
                     row_blocks.append(block)
@@ -163,6 +216,7 @@ class StochasticAdvectionKernel(nn.Module):
                 "drift_terms": torch.stack(drift_terms, dim=0),
                 "dispersion_terms": torch.stack(dispersion_terms, dim=0),
                 "block_scales": block_scales,
+                "component_mask": component_mask,
                 "identity_mix": identity_mix,
             },
         )
