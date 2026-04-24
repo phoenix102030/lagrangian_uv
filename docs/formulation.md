@@ -173,7 +173,7 @@ So `M_t` is the learned, time-varying propagation matrix induced by the stochast
 The forecasting model then augments this kernel transport with:
 
 - a learned persistence diagonal,
-- an advection residual gate,
+- a kernel-mix coefficient,
 - and a direct NWP forcing term.
 
 Let
@@ -187,19 +187,13 @@ p_r \in [p_{\min}, p_{\max}],
 be the learned persistence matrix, and let
 
 ```math
-g \in [0, g_{\max}]
+k \in [k_{\min}, k_{\max}]
 ```
 
-be a learned scalar residual gate. Define the residual transport
+be a learned scalar kernel-mix coefficient. The implemented dynamics matrix is
 
 ```math
-R_t = M_t - I_6.
-```
-
-The implemented dynamics matrix is
-
-```math
-A_t = P + g R_t.
+A_t = (1-k)P + k M_t.
 ```
 
 The NWP encoders also produce a direct forcing term
@@ -216,7 +210,7 @@ y_t = A_t y_{t-1} + b_t + \eta_t,
 \eta_t \sim \mathcal{N}(0, Q).
 ```
 
-This gives the model a strong persistence backbone, while letting the advection kernel learn residual transport beyond persistence.
+This keeps a persistence backbone, but it no longer lets the model collapse the transport term to an arbitrarily small residual.
 
 ## 5. IDE Interpretation
 
@@ -323,7 +317,7 @@ the model performs the following steps:
 b_t = f_{\theta_b}(x^u_t, x^v_t).
 ```
 
-2. Build `K_t`, then `M_t`, then `A_t = P + g(M_t - I_6)`.
+2. Build `K_t`, then `M_t`, then `A_t = (1-k)P + k M_t`.
 3. Run the Kalman filter for
 
 ```math

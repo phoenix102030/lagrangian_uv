@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from itertools import permutations
 from typing import Any
@@ -8,6 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .utils import mat as mat_utils
 from .utils.mat import load_mat_variable
 
 
@@ -57,12 +59,162 @@ class Standardizer:
         )
 
 
+class InMemorySequenceSource:
+    def __init__(self, array: np.ndarray) -> None:
+        self.array = _sanitize_array(array)
+        self.num_channels = int(self.array.shape[1])
+
+    def __len__(self) -> int:
+        return int(self.array.shape[0])
+
+    def window(self, start: int, end: int) -> np.ndarray:
+        return self.array[start:end]
+
+
+class LazyNwpSequenceSource:
+    def __init__(
+        self,
+        path: str,
+        var_name: str,
+        grid_size: tuple[int, int],
+        total_channels: int,
+        channel_indices: list[int],
+        cache_chunk_size: int = 512,
+        max_cache_chunks: int = 4,
+    ) -> None:
+        if mat_utils.h5py is None:
+            raise RuntimeError("Lazy NWP loading requires h5py.")
+
+        self.path = str(path)
+        self.var_name = var_name
+        self.grid_size = tuple(grid_size)
+        self.total_channels = int(total_channels)
+        self.channel_indices = np.asarray(channel_indices, dtype=np.int64)
+        self.num_channels = int(len(channel_indices))
+        self.cache_chunk_size = max(1, int(cache_chunk_size))
+        self.max_cache_chunks = max(1, int(max_cache_chunks))
+
+        self._file: Any | None = None
+        self._dataset: Any | None = None
+        self._chunk_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+
+        with mat_utils.h5py.File(self.path, "r") as handle:
+            if self.var_name not in handle:
+                raise KeyError(f"Variable {self.var_name!r} not found in {self.path}.")
+            dataset = handle[self.var_name]
+            self.source_shape = tuple(int(dim) for dim in dataset.shape)
+
+        self.permutation = _infer_hw_t_c_permutation(self.source_shape, self.grid_size, self.total_channels)
+        self.time_axis = int(self.permutation[2])
+        self.length = int(self.source_shape[self.time_axis])
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_file"] = None
+        state["_dataset"] = None
+        state["_chunk_cache"] = OrderedDict()
+        return state
+
+    def _ensure_open(self) -> Any:
+        if self._dataset is None:
+            self._file = mat_utils.h5py.File(self.path, "r")
+            self._dataset = self._file[self.var_name]
+        return self._dataset
+
+    def _read_range(self, start: int, end: int) -> np.ndarray:
+        dataset = self._ensure_open()
+        source_slices: list[slice] = [slice(None)] * 4
+        source_slices[self.time_axis] = slice(start, end)
+        block = np.asarray(dataset[tuple(source_slices)], dtype=np.float32)
+        block = np.transpose(block, self.permutation)
+        block = block[:, :, :, self.channel_indices]
+        block = np.transpose(block, (2, 3, 0, 1))
+        return _sanitize_array(block)
+
+    def _cached_chunk(self, chunk_index: int) -> np.ndarray:
+        cached = self._chunk_cache.get(chunk_index)
+        if cached is not None:
+            self._chunk_cache.move_to_end(chunk_index)
+            return cached
+
+        start = chunk_index * self.cache_chunk_size
+        end = min(start + self.cache_chunk_size, self.length)
+        chunk = self._read_range(start, end)
+        self._chunk_cache[chunk_index] = chunk
+        self._chunk_cache.move_to_end(chunk_index)
+        while len(self._chunk_cache) > self.max_cache_chunks:
+            self._chunk_cache.popitem(last=False)
+        return chunk
+
+    def window(self, start: int, end: int) -> np.ndarray:
+        if start < 0 or end < start or end > self.length:
+            raise IndexError(f"Invalid window [{start}, {end}) for sequence length {self.length}.")
+
+        pieces: list[np.ndarray] = []
+        cursor = start
+        while cursor < end:
+            chunk_index = cursor // self.cache_chunk_size
+            chunk = self._cached_chunk(chunk_index)
+            chunk_start = chunk_index * self.cache_chunk_size
+            local_start = cursor - chunk_start
+            local_end = min(end - chunk_start, chunk.shape[0])
+            pieces.append(chunk[local_start:local_end])
+            cursor = chunk_start + local_end
+
+        if not pieces:
+            return np.empty((0, self.num_channels, *self.grid_size), dtype=np.float32)
+        if len(pieces) == 1:
+            return pieces[0]
+        return np.concatenate(pieces, axis=0)
+
+
+class StandardizedSequenceSource:
+    def __init__(self, base_source: InMemorySequenceSource | LazyNwpSequenceSource, scaler: Standardizer) -> None:
+        self.base_source = base_source
+        self.scaler = scaler
+        self.num_channels = int(base_source.num_channels)
+
+    def __len__(self) -> int:
+        return len(self.base_source)
+
+    def window(self, start: int, end: int) -> np.ndarray:
+        return self.scaler.transform(self.base_source.window(start, end))
+
+
+class OffsetSequenceSource:
+    def __init__(
+        self,
+        base_source: InMemorySequenceSource | LazyNwpSequenceSource | StandardizedSequenceSource,
+        start_offset: int,
+        end_offset: int,
+    ) -> None:
+        if start_offset < 0 or end_offset < start_offset or end_offset > len(base_source):
+            raise ValueError(
+                f"Invalid source slice [{start_offset}, {end_offset}) for source length {len(base_source)}."
+            )
+        self.base_source = base_source
+        self.start_offset = int(start_offset)
+        self.end_offset = int(end_offset)
+        self.num_channels = int(base_source.num_channels)
+
+    def __len__(self) -> int:
+        return self.end_offset - self.start_offset
+
+    def window(self, start: int, end: int) -> np.ndarray:
+        if start < 0 or end < start or end > len(self):
+            raise IndexError(f"Invalid local window [{start}, {end}) for sliced sequence length {len(self)}.")
+        return self.base_source.window(self.start_offset + start, self.start_offset + end)
+
+
 class WindowedSequenceDataset(Dataset):
     def __init__(
         self,
         observations: np.ndarray,
-        nwp_u: np.ndarray,
-        nwp_v: np.ndarray,
+        nwp_u: InMemorySequenceSource | LazyNwpSequenceSource | StandardizedSequenceSource | OffsetSequenceSource,
+        nwp_v: InMemorySequenceSource | LazyNwpSequenceSource | StandardizedSequenceSource | OffsetSequenceSource,
         window_size: int,
         stride: int,
     ) -> None:
@@ -73,10 +225,10 @@ class WindowedSequenceDataset(Dataset):
                 f"Sequence length {len(observations)} is shorter than the window size {window_size}."
             )
 
-        self.observations = torch.from_numpy(observations).float()
-        self.nwp_u = torch.from_numpy(nwp_u).float()
-        self.nwp_v = torch.from_numpy(nwp_v).float()
-        self.window_size = window_size
+        self.observations = torch.from_numpy(_sanitize_array(observations)).float()
+        self.nwp_u = nwp_u
+        self.nwp_v = nwp_v
+        self.window_size = int(window_size)
         self.start_indices = list(range(0, len(observations) - window_size + 1, stride))
 
     def __len__(self) -> int:
@@ -87,8 +239,8 @@ class WindowedSequenceDataset(Dataset):
         end = start + self.window_size
         return {
             "obs": self.observations[start:end],
-            "nwp_u": self.nwp_u[start:end],
-            "nwp_v": self.nwp_v[start:end],
+            "nwp_u": torch.from_numpy(self.nwp_u.window(start, end)).float(),
+            "nwp_v": torch.from_numpy(self.nwp_v.window(start, end)).float(),
             "start_index": start,
         }
 
@@ -125,21 +277,22 @@ def _ensure_time_feature_matrix(array: np.ndarray, min_feature_count: int) -> np
     )
 
 
-def _ensure_hw_t_c(array: np.ndarray, grid_size: tuple[int, int], total_channels: int) -> np.ndarray:
-    if array.ndim != 4:
-        raise ValueError(f"Expected a 4D NWP array, got shape {array.shape}.")
-
-    if tuple(array.shape[:2]) == grid_size and array.shape[-1] == total_channels:
-        return array
+def _infer_hw_t_c_permutation(
+    shape: tuple[int, ...],
+    grid_size: tuple[int, int],
+    total_channels: int,
+) -> tuple[int, int, int, int]:
+    if len(shape) != 4:
+        raise ValueError(f"Expected a 4D NWP array, got shape {shape}.")
 
     for perm in permutations(range(4)):
-        permuted = np.transpose(array, perm)
-        if tuple(permuted.shape[:2]) == grid_size and permuted.shape[-1] == total_channels:
-            return permuted
+        permuted_shape = tuple(shape[axis] for axis in perm)
+        if tuple(permuted_shape[:2]) == grid_size and permuted_shape[-1] == total_channels:
+            return tuple(int(axis) for axis in perm)
 
     raise ValueError(
         "Could not infer the NWP layout. "
-        f"Observed shape: {array.shape}, expected grid {grid_size} and >= {total_channels} channels."
+        f"Observed shape: {shape}, expected grid {grid_size} and {total_channels} channels."
     )
 
 
@@ -172,27 +325,88 @@ def _load_site_coords(config: dict[str, Any]) -> np.ndarray:
 def _select_measurement_block(config: dict[str, Any], subset: str) -> np.ndarray:
     meas_cfg = config["data"]["measurement"]
     raw = load_mat_variable(meas_cfg[f"{subset}_path"], meas_cfg["variable_name"])
-    raw = _ensure_time_feature_matrix(np.asarray(raw, dtype=np.float32), min_feature_count=max(meas_cfg["target_raw_indices"]) + 1)
+    raw = _ensure_time_feature_matrix(
+        np.asarray(raw, dtype=np.float32),
+        min_feature_count=max(meas_cfg["target_raw_indices"]) + 1,
+    )
     block = raw[:, meas_cfg["target_raw_indices"]]
     block = block[:, meas_cfg["component_first_order"]]
     return _sanitize_array(block)
 
 
-def _select_nwp_blocks(config: dict[str, Any], subset: str) -> tuple[np.ndarray, np.ndarray]:
+def _select_nwp_source(config: dict[str, Any], subset: str, channel_indices: list[int]) -> InMemorySequenceSource | LazyNwpSequenceSource:
     nwp_cfg = config["data"]["nwp"]
-    grid_size = tuple(nwp_cfg["grid_size"])
-    raw = load_mat_variable(nwp_cfg[f"{subset}_path"], nwp_cfg["variable_name"])
-    raw = _ensure_hw_t_c(np.asarray(raw, dtype=np.float32), grid_size=grid_size, total_channels=nwp_cfg["total_channels"])
+    path = nwp_cfg[f"{subset}_path"]
+
+    if mat_utils.h5py is not None:
+        try:
+            return LazyNwpSequenceSource(
+                path=path,
+                var_name=nwp_cfg["variable_name"],
+                grid_size=tuple(nwp_cfg["grid_size"]),
+                total_channels=int(nwp_cfg["total_channels"]),
+                channel_indices=list(channel_indices),
+            )
+        except Exception:
+            pass
+
+    raw = load_mat_variable(path, nwp_cfg["variable_name"])
+    permutation = _infer_hw_t_c_permutation(tuple(np.asarray(raw).shape), tuple(nwp_cfg["grid_size"]), int(nwp_cfg["total_channels"]))
+    raw = np.transpose(np.asarray(raw, dtype=np.float32), permutation)
+    raw = raw[:, :, :, channel_indices]
     raw = np.transpose(raw, (2, 3, 0, 1))
-
-    u_block = raw[:, nwp_cfg["u_channel_indices"], :, :]
-    v_block = raw[:, nwp_cfg["v_channel_indices"], :, :]
-    return _sanitize_array(u_block), _sanitize_array(v_block)
+    return InMemorySequenceSource(raw)
 
 
-def _align_lengths(obs: np.ndarray, nwp_u: np.ndarray, nwp_v: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    length = min(len(obs), len(nwp_u), len(nwp_v))
-    return obs[:length], nwp_u[:length], nwp_v[:length]
+def _fit_nwp_standardizer(
+    source: InMemorySequenceSource | LazyNwpSequenceSource,
+    train_length: int,
+    eps: float,
+    chunk_size: int = 256,
+) -> Standardizer:
+    if train_length <= 0:
+        raise ValueError("train_length must be positive when fitting NWP standardization.")
+
+    total_count = 0.0
+    sum_array: np.ndarray | None = None
+    sumsq_array: np.ndarray | None = None
+
+    for start in range(0, train_length, chunk_size):
+        end = min(start + chunk_size, train_length)
+        chunk = source.window(start, end).astype(np.float64, copy=False)
+        chunk_sum = chunk.sum(axis=(0, 2, 3), keepdims=True)
+        chunk_sumsq = (chunk * chunk).sum(axis=(0, 2, 3), keepdims=True)
+        chunk_count = float(chunk.shape[0] * chunk.shape[2] * chunk.shape[3])
+
+        if sum_array is None:
+            sum_array = chunk_sum
+            sumsq_array = chunk_sumsq
+        else:
+            sum_array += chunk_sum
+            sumsq_array += chunk_sumsq
+        total_count += chunk_count
+
+    if sum_array is None or sumsq_array is None or total_count <= 0.0:
+        raise RuntimeError("Failed to accumulate NWP standardization statistics.")
+
+    mean = sum_array / total_count
+    variance = np.maximum((sumsq_array / total_count) - np.square(mean), 0.0)
+    std = np.sqrt(variance)
+    std = np.where(std < eps, 1.0, std)
+    return Standardizer(mean=mean.astype(np.float32), std=std.astype(np.float32))
+
+
+def _materialize_sequence(
+    source: InMemorySequenceSource | LazyNwpSequenceSource | StandardizedSequenceSource | OffsetSequenceSource,
+    chunk_size: int = 256,
+) -> np.ndarray:
+    chunks = []
+    for start in range(0, len(source), chunk_size):
+        end = min(start + chunk_size, len(source))
+        chunks.append(source.window(start, end))
+    if not chunks:
+        return np.empty((0, source.num_channels, 0, 0), dtype=np.float32)
+    return np.concatenate(chunks, axis=0)
 
 
 def _build_feature_names(config: dict[str, Any]) -> list[str]:
@@ -207,16 +421,12 @@ def build_data_bundle(
     include_online: bool = True,
 ) -> DataBundle:
     obs_offline = _select_measurement_block(config, "offline")
-    nwp_u_offline, nwp_v_offline = _select_nwp_blocks(config, "offline")
-    obs_offline, nwp_u_offline, nwp_v_offline = _align_lengths(obs_offline, nwp_u_offline, nwp_v_offline)
+    nwp_cfg = config["data"]["nwp"]
+    nwp_u_offline_source = _select_nwp_source(config, "offline", list(nwp_cfg["u_channel_indices"]))
+    nwp_v_offline_source = _select_nwp_source(config, "offline", list(nwp_cfg["v_channel_indices"]))
 
-    obs_online: np.ndarray | None = None
-    nwp_u_online: np.ndarray | None = None
-    nwp_v_online: np.ndarray | None = None
-    if include_online:
-        obs_online = _select_measurement_block(config, "online")
-        nwp_u_online, nwp_v_online = _select_nwp_blocks(config, "online")
-        obs_online, nwp_u_online, nwp_v_online = _align_lengths(obs_online, nwp_u_online, nwp_v_online)
+    offline_length = min(len(obs_offline), len(nwp_u_offline_source), len(nwp_v_offline_source))
+    obs_offline = obs_offline[:offline_length]
 
     split_fraction = float(config["data"]["split"]["train_fraction"])
     split_index = int(len(obs_offline) * split_fraction)
@@ -239,43 +449,51 @@ def build_data_bundle(
             obs_scaler = Standardizer.identity((1, obs_offline.shape[-1]))
 
         if norm_cfg["normalize_nwp"]:
-            nwp_u_scaler = Standardizer.fit(nwp_u_offline[:split_index], axes=(0, 2, 3), eps=eps)
-            nwp_v_scaler = Standardizer.fit(nwp_v_offline[:split_index], axes=(0, 2, 3), eps=eps)
+            nwp_u_scaler = _fit_nwp_standardizer(nwp_u_offline_source, train_length=split_index, eps=eps)
+            nwp_v_scaler = _fit_nwp_standardizer(nwp_v_offline_source, train_length=split_index, eps=eps)
         else:
-            nwp_u_scaler = Standardizer.identity((1, nwp_u_offline.shape[1], 1, 1))
-            nwp_v_scaler = Standardizer.identity((1, nwp_v_offline.shape[1], 1, 1))
+            nwp_u_scaler = Standardizer.identity((1, nwp_u_offline_source.num_channels, 1, 1))
+            nwp_v_scaler = Standardizer.identity((1, nwp_v_offline_source.num_channels, 1, 1))
     else:
         obs_scaler = Standardizer.from_state_dict(scaler_state["obs"])
         nwp_u_scaler = Standardizer.from_state_dict(scaler_state["nwp_u"])
         nwp_v_scaler = Standardizer.from_state_dict(scaler_state["nwp_v"])
 
     obs_offline = obs_scaler.transform(obs_offline)
-    nwp_u_offline = nwp_u_scaler.transform(nwp_u_offline)
-    nwp_v_offline = nwp_v_scaler.transform(nwp_v_offline)
+    nwp_u_offline_standardized = StandardizedSequenceSource(nwp_u_offline_source, nwp_u_scaler)
+    nwp_v_offline_standardized = StandardizedSequenceSource(nwp_v_offline_source, nwp_v_scaler)
 
     online_sequence: dict[str, torch.Tensor] | None = None
-    if include_online and obs_online is not None and nwp_u_online is not None and nwp_v_online is not None:
-        obs_online = obs_scaler.transform(obs_online)
-        nwp_u_online = nwp_u_scaler.transform(nwp_u_online)
-        nwp_v_online = nwp_v_scaler.transform(nwp_v_online)
+    if include_online:
+        obs_online = _select_measurement_block(config, "online")
+        nwp_u_online_source = _select_nwp_source(config, "online", list(nwp_cfg["u_channel_indices"]))
+        nwp_v_online_source = _select_nwp_source(config, "online", list(nwp_cfg["v_channel_indices"]))
+        online_length = min(len(obs_online), len(nwp_u_online_source), len(nwp_v_online_source))
+        obs_online = obs_scaler.transform(obs_online[:online_length])
+        online_u = _materialize_sequence(
+            OffsetSequenceSource(StandardizedSequenceSource(nwp_u_online_source, nwp_u_scaler), 0, online_length)
+        )
+        online_v = _materialize_sequence(
+            OffsetSequenceSource(StandardizedSequenceSource(nwp_v_online_source, nwp_v_scaler), 0, online_length)
+        )
         online_sequence = {
-            "obs": torch.from_numpy(obs_online).float(),
-            "nwp_u": torch.from_numpy(nwp_u_online).float(),
-            "nwp_v": torch.from_numpy(nwp_v_online).float(),
+            "obs": torch.from_numpy(obs_online[:online_length]).float(),
+            "nwp_u": torch.from_numpy(online_u[:online_length]).float(),
+            "nwp_v": torch.from_numpy(online_v[:online_length]).float(),
         }
 
     window_cfg = config["data"]["windows"]
     train_dataset = WindowedSequenceDataset(
         observations=obs_offline[:split_index],
-        nwp_u=nwp_u_offline[:split_index],
-        nwp_v=nwp_v_offline[:split_index],
+        nwp_u=OffsetSequenceSource(nwp_u_offline_standardized, 0, split_index),
+        nwp_v=OffsetSequenceSource(nwp_v_offline_standardized, 0, split_index),
         window_size=int(window_cfg["window_size"]),
         stride=int(window_cfg["stride"]),
     )
     val_dataset = WindowedSequenceDataset(
         observations=obs_offline[split_index:],
-        nwp_u=nwp_u_offline[split_index:],
-        nwp_v=nwp_v_offline[split_index:],
+        nwp_u=OffsetSequenceSource(nwp_u_offline_standardized, split_index, len(obs_offline)),
+        nwp_v=OffsetSequenceSource(nwp_v_offline_standardized, split_index, len(obs_offline)),
         window_size=int(window_cfg["window_size"]),
         stride=int(window_cfg["stride"]),
     )

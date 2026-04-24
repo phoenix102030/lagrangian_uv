@@ -182,6 +182,11 @@ def train(config: dict[str, Any]) -> Path:
         model = torch.nn.DataParallel(model)
 
     if _is_main_process(context):
+        print(
+            "Data bundle ready "
+            f"(train_windows={len(bundle.train_dataset)}, val_windows={len(bundle.val_dataset)}, "
+            f"online_loaded={bundle.online_sequence is not None})"
+        )
         if context.enabled:
             backend = str(config["training"].get("ddp_backend", "nccl"))
             print(

@@ -648,6 +648,7 @@ def export_window_diagnostics(
     block_scales = _to_numpy(outputs["block_scales"])
     persistence_diagonal = _to_numpy(outputs["persistence_diagonal"])
     persistence_matrix = _to_numpy(outputs["persistence_matrix"])
+    kernel_mix = float(_to_numpy(outputs.get("kernel_mix", outputs["residual_gate"])).reshape(-1)[0])
     residual_gate = float(_to_numpy(outputs["residual_gate"]).reshape(-1)[0])
     residual_transition = _to_numpy(outputs["residual_transition"])
     identity_mix = float(_to_numpy(outputs["identity_mix"]).reshape(-1)[0])
@@ -672,6 +673,7 @@ def export_window_diagnostics(
         "transition": transition,
         "persistence_diagonal": persistence_diagonal,
         "persistence_matrix": persistence_matrix,
+        "kernel_mix": np.asarray([kernel_mix], dtype=np.float32),
         "residual_gate": np.asarray([residual_gate], dtype=np.float32),
         "residual_transition": residual_transition,
         "process_covariance_matrix": q_matrix,
@@ -730,6 +732,7 @@ def export_window_diagnostics(
         },
         "dynamics_parameters": {
             "persistence_diagonal": persistence_diagonal.tolist(),
+            "kernel_mix": kernel_mix,
             "residual_gate": residual_gate,
             "identity_mix": identity_mix,
         },

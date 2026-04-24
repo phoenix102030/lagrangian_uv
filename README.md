@@ -1,3 +1,7 @@
+python -m scripts.export_diagnostics    --config configs/default.yaml   --checkpoint outputs/stage2_uv_02/best.pt   --split val    --window-index 0
+
+python scripts/rolling_forecast.py   --config configs/default.yaml   --checkpoint outputs/stage2_uv/best.pt
+
 # Lagrangian UV Stage-2
 
 This is a clean, isolated reimplementation of the original DeepMIDE idea for the second-stage kernel you described.
@@ -46,7 +50,7 @@ which is the block-diagonal `Sigma_gamma` analogue of the theorem-inspired const
 The current default experiment also adds three forecasting-oriented changes:
 
 1. A learned persistence backbone, so the state update starts from an explicit autoregressive baseline.
-2. An advection residual term, so the kernel only needs to learn the increment beyond persistence.
+2. A persistence-versus-kernel mixture, so transport stays on the main path instead of collapsing into a tiny residual.
 3. A direct NWP forcing head and a hybrid training objective that mixes Kalman likelihood with one-step and multi-step forecast losses.
 
 ## Project Layout
@@ -125,7 +129,7 @@ This writes:
 - `learned_parameters.npz`: every learned parameter from the model state dict
 - `parameter_summary.json`: names and shapes of all learned parameters
 - `transition_matrices.npy`: the full time-varying `6 x 6` dynamics matrix sequence
-- `kernel_transition_matrices.npy`: the raw kernel-induced transition sequence before persistence/residual blending
+- `kernel_transition_matrices.npy`: the raw kernel-induced transition sequence before persistence/kernel mixing
 - `forcing.npy`: the learned NWP forcing sequence
 - `advection_means.csv` and `advection_covariances.csv`: tabular exports of `\mu_t` and `\Sigma_t`
 - `transition_matrix_long.csv`: all transition entries in long format
@@ -162,7 +166,7 @@ Everything likely to change is exposed in `configs/default.yaml`, including:
 - hybrid objective weights and forecast-loss horizon
 - NWP encoder width and dropout
 - advection mean scale
-- persistence diagonal range, residual gate range, and forcing scale
+- persistence diagonal range, kernel-mix range, and forcing scale
 - kernel jitter and identity mixing
 - Kalman linear algebra dtype and adaptive Cholesky jitter
 - robust matrix sanitization and diagonal fallback for early training

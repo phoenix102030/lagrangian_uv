@@ -99,8 +99,9 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         self.linalg_dtype = _resolve_dtype(model_cfg.get("linear_algebra_dtype", "float64"))
         self.max_nll_per_timestep = float(config["training"].get("max_nll_per_timestep", 1.0e4))
         self.persistence_min = float(model_cfg.get("persistence_min", 0.6))
-        self.persistence_max = float(model_cfg.get("persistence_max", 1.05))
-        self.residual_max = float(model_cfg.get("residual_max", 0.5))
+        self.persistence_max = float(model_cfg.get("persistence_max", 0.98))
+        self.kernel_mix_min = float(model_cfg.get("kernel_mix_min", 0.35))
+        self.kernel_mix_max = float(model_cfg.get("kernel_mix_max", 1.0))
         self.nll_weight = float(config["training"].get("nll_weight", 1.0))
         self.one_step_forecast_weight = float(config["training"].get("one_step_forecast_weight", 0.0))
         self.rollout_forecast_weight = float(config["training"].get("rollout_forecast_weight", 0.0))
@@ -149,7 +150,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             jitter=float(cov_cfg["initial_state"]["jitter"]),
         )
         persistence_init = float(model_cfg.get("persistence_init", 0.98))
-        residual_init = float(model_cfg.get("residual_init", 0.05))
+        kernel_mix_init = float(model_cfg.get("kernel_mix_init", 0.7))
         self.persistence_raw = nn.Parameter(
             torch.full(
                 (self.state_dim,),
@@ -159,7 +160,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         )
         self.residual_gate_raw = nn.Parameter(
             torch.tensor(
-                _inverse_sigmoid_range(residual_init, 0.0, self.residual_max),
+                _inverse_sigmoid_range(kernel_mix_init, self.kernel_mix_min, self.kernel_mix_max),
                 dtype=torch.float32,
             )
         )
@@ -170,8 +171,8 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
     def _persistence_diagonal(self) -> torch.Tensor:
         return _sigmoid_range(self.persistence_raw, self.persistence_min, self.persistence_max)
 
-    def _residual_gate(self) -> torch.Tensor:
-        return _sigmoid_range(self.residual_gate_raw, 0.0, self.residual_max)
+    def _kernel_mix(self) -> torch.Tensor:
+        return _sigmoid_range(self.residual_gate_raw, self.kernel_mix_min, self.kernel_mix_max)
 
     def _build_dynamics(
         self,
@@ -185,15 +186,17 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         )
         persistence_diag = self._persistence_diagonal().to(device=kernel_transition.device, dtype=kernel_transition.dtype)
         persistence_matrix = torch.diag(persistence_diag)
-        residual_gate = self._residual_gate().to(device=kernel_transition.device, dtype=kernel_transition.dtype)
+        kernel_mix = self._kernel_mix().to(device=kernel_transition.device, dtype=kernel_transition.dtype)
+        persistence_backbone = persistence_matrix.unsqueeze(0)
         residual_transition = kernel_transition - identity
-        dynamics = persistence_matrix.unsqueeze(0) + residual_gate * residual_transition
+        dynamics = (1.0 - kernel_mix) * persistence_backbone + kernel_mix * kernel_transition
         dynamics = _sanitize_operator_matrix(dynamics)
         return dynamics, {
             "kernel_transition": kernel_transition,
             "persistence_diagonal": persistence_diag,
             "persistence_matrix": persistence_matrix,
-            "residual_gate": residual_gate,
+            "kernel_mix": kernel_mix,
+            "residual_gate": kernel_mix,
             "residual_transition": residual_transition,
         }
 

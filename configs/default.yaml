@@ -55,11 +55,12 @@ model:
   mean_scale: 4.0
   sigma_floor: 1e-3
   forcing_scale: 2.0
-  persistence_init: 0.98
+  persistence_init: 0.9
   persistence_min: 0.6
-  persistence_max: 1.05
-  residual_init: 0.05
-  residual_max: 0.5
+  persistence_max: 0.98
+  kernel_mix_init: 0.7
+  kernel_mix_min: 0.35
+  kernel_mix_max: 1.0
 
   encoder:
     hidden_dim: 128
@@ -85,8 +86,8 @@ covariance:
 
 training:
   device: cuda
-  batch_size: 16
-  gradient_accumulation_steps: 1
+  batch_size: 4
+  gradient_accumulation_steps: 4
   epochs: 100
   learning_rate: 1e-4
   adam_eps: 1e-6
