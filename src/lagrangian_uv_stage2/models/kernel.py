@@ -125,13 +125,18 @@ class StochasticAdvectionKernel(nn.Module):
         cov_j: torch.Tensor,
         same_component: bool,
         eye2: torch.Tensor,
+        cross_cov_ij: torch.Tensor | None = None,
+        cross_cov_ji: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if same_component:
             drift = self.delta_t * mean_i
             dispersion = eye2 + 2.0 * (self.delta_t**2) * cov_i
         else:
             drift = self.delta_t * (mean_i - mean_j)
-            dispersion = eye2 + 2.0 * (self.delta_t**2) * (cov_i + cov_j)
+            relative_covariance = cov_i + cov_j
+            if cross_cov_ij is not None and cross_cov_ji is not None:
+                relative_covariance = relative_covariance - cross_cov_ij - cross_cov_ji
+            dispersion = eye2 + 2.0 * (self.delta_t**2) * relative_covariance
         drift = _sanitize_vector(drift)
         dispersion = _sanitize_matrix(dispersion + self.kernel_jitter * eye2)
         return drift, dispersion
@@ -141,6 +146,7 @@ class StochasticAdvectionKernel(nn.Module):
         means: torch.Tensor,
         covariances: torch.Tensor,
         site_coords: torch.Tensor,
+        joint_covariance: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         # AMP autocast can make means/covariances float16. Keep the small
         # kernel linear algebra in float32: CUDA cholesky_ex is not implemented
@@ -150,6 +156,8 @@ class StochasticAdvectionKernel(nn.Module):
         kernel_dtype = torch.float32
         means = _sanitize_vector(means.to(dtype=kernel_dtype))
         covariances = _sanitize_matrix(covariances.to(dtype=kernel_dtype))
+        if joint_covariance is not None:
+            joint_covariance = _sanitize_matrix(joint_covariance.to(dtype=kernel_dtype))
         site_coords = site_coords.to(device=means.device, dtype=kernel_dtype)
         spatial_lags = _sanitize_vector(site_coords.unsqueeze(1) - site_coords.unsqueeze(0))
         block_scales = self._block_scales().to(means.device, kernel_dtype)
@@ -173,6 +181,13 @@ class StochasticAdvectionKernel(nn.Module):
                 row_dispersion = []
 
                 for j in range(self.num_components):
+                    cross_cov_ij = None
+                    cross_cov_ji = None
+                    if joint_covariance is not None:
+                        i_start = i * 2
+                        j_start = j * 2
+                        cross_cov_ij = joint_covariance[t, i_start : i_start + 2, j_start : j_start + 2]
+                        cross_cov_ji = joint_covariance[t, j_start : j_start + 2, i_start : i_start + 2]
                     drift, dispersion = self._block_drift_dispersion(
                         mean_i=means[t, i],
                         mean_j=means[t, j],
@@ -180,6 +195,8 @@ class StochasticAdvectionKernel(nn.Module):
                         cov_j=covariances[t, j],
                         same_component=(i == j),
                         eye2=eye2,
+                        cross_cov_ij=cross_cov_ij,
+                        cross_cov_ji=cross_cov_ji,
                     )
                     dispersion, inv_dispersion, log_det = _stable_inverse_logdet(
                         dispersion,

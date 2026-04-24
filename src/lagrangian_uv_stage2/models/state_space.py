@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .backbone import DualBranchAdvectionNet
+from .backbone import DualBranchAdvectionNet, JointAdvectionNet
 from .covariance import PositiveDiagonal, SeparableCrossCovariance
 from .kernel import StochasticAdvectionKernel
 
@@ -107,6 +107,8 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         self.rollout_forecast_weight = float(config["training"].get("rollout_forecast_weight", 0.0))
         self.kernel_one_step_weight = float(config["training"].get("kernel_one_step_weight", 0.0))
         self.shared_component_advection = bool(model_cfg.get("shared_component_advection", True))
+        self.joint_component_advection = bool(model_cfg.get("joint_component_advection", False))
+        self.row_normalize_dynamics = bool(model_cfg.get("row_normalize_dynamics", False))
         self.forecast_loss_horizon = int(config["training"].get("forecast_loss_horizon", 0))
         self.forecast_loss_min_context = int(config["training"].get("forecast_loss_min_context", 1))
         self.scheduled_sampling_ratio = float(config["training"].get("scheduled_sampling_start", 0.0))
@@ -115,18 +117,33 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         self.register_buffer("site_coords", torch.as_tensor(site_coords, dtype=torch.float32))
 
         input_channels = len(config["data"]["nwp"]["u_channel_indices"])
-        self.advection_net = DualBranchAdvectionNet(
-            input_channels=input_channels,
-            hidden_dim=int(encoder_cfg["hidden_dim"]),
-            dropout=float(encoder_cfg["dropout"]),
-            norm_groups=int(encoder_cfg["norm_groups"]),
-            mean_scale=float(model_cfg["mean_scale"]),
-            sigma_floor=float(model_cfg["sigma_floor"]),
-            share_encoder=bool(encoder_cfg["share_encoder"]),
-            state_dim=self.state_dim,
-            forcing_scale=float(model_cfg.get("forcing_scale", 0.0)),
-            temporal_model=str(encoder_cfg.get("temporal_model", "gru")),
-        )
+        if self.joint_component_advection:
+            self.advection_net = JointAdvectionNet(
+                input_channels=input_channels,
+                hidden_dim=int(encoder_cfg["hidden_dim"]),
+                dropout=float(encoder_cfg["dropout"]),
+                norm_groups=int(encoder_cfg["norm_groups"]),
+                mean_scale=float(model_cfg["mean_scale"]),
+                sigma_floor=float(model_cfg["sigma_floor"]),
+                state_dim=self.state_dim,
+                forcing_scale=float(model_cfg.get("forcing_scale", 0.0)),
+                temporal_model=str(encoder_cfg.get("temporal_model", "gru")),
+                num_components=self.num_components,
+                spatial_dim=int(model_cfg.get("spatial_dim", 2)),
+            )
+        else:
+            self.advection_net = DualBranchAdvectionNet(
+                input_channels=input_channels,
+                hidden_dim=int(encoder_cfg["hidden_dim"]),
+                dropout=float(encoder_cfg["dropout"]),
+                norm_groups=int(encoder_cfg["norm_groups"]),
+                mean_scale=float(model_cfg["mean_scale"]),
+                sigma_floor=float(model_cfg["sigma_floor"]),
+                share_encoder=bool(encoder_cfg["share_encoder"]),
+                state_dim=self.state_dim,
+                forcing_scale=float(model_cfg.get("forcing_scale", 0.0)),
+                temporal_model=str(encoder_cfg.get("temporal_model", "gru")),
+            )
         self.kernel = StochasticAdvectionKernel(
             num_sites=self.num_sites,
             num_components=self.num_components,
@@ -181,6 +198,8 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         return _sigmoid_range(self.residual_gate_raw, self.kernel_mix_min, self.kernel_mix_max)
 
     def _apply_advection_constraints(self, advection: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if self.joint_component_advection or "joint_covariance" in advection:
+            return advection
         if not self.shared_component_advection:
             return advection
 
@@ -210,6 +229,10 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         residual_transition = kernel_transition - identity
         dynamics = (1.0 - kernel_mix) * persistence_backbone + kernel_mix * kernel_transition
         dynamics = _sanitize_operator_matrix(dynamics)
+        if self.row_normalize_dynamics:
+            row_sum = dynamics.sum(dim=-1, keepdim=True).clamp_min(self.transition_jitter)
+            dynamics = dynamics / row_sum
+            dynamics = _sanitize_operator_matrix(dynamics)
         return dynamics, {
             "kernel_transition": kernel_transition,
             "persistence_diagonal": persistence_diag,
@@ -217,6 +240,11 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             "kernel_mix": kernel_mix,
             "residual_gate": kernel_mix,
             "residual_transition": residual_transition,
+            "row_normalize_dynamics": torch.as_tensor(
+                float(self.row_normalize_dynamics),
+                device=kernel_transition.device,
+                dtype=kernel_transition.dtype,
+            ),
         }
 
     def _compute_training_loss(
@@ -287,6 +315,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             means=advection["means"],
             covariances=advection["covariances"],
             site_coords=self.site_coords,
+            joint_covariance=advection.get("joint_covariance"),
         )
         dynamics, dynamics_aux = self._build_dynamics(kernel_transition)
         kalman = self.kalman_filter(
@@ -469,6 +498,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             means=advection["means"],
             covariances=advection["covariances"],
             site_coords=self.site_coords,
+            joint_covariance=advection.get("joint_covariance"),
         )
         dynamics, dynamics_aux = self._build_dynamics(kernel_transition)
         q_matrix = self.process_covariance(self.site_coords).to(

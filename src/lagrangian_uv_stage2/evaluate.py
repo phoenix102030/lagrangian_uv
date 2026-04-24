@@ -342,6 +342,7 @@ def _advection_diagnostics(
     component_names: list[str],
     raw_means: np.ndarray | None = None,
     raw_covariances: np.ndarray | None = None,
+    joint_covariance: np.ndarray | None = None,
 ) -> dict[str, Any]:
     means = np.asarray(means, dtype=np.float64)
     covariances = np.asarray(covariances, dtype=np.float64)
@@ -375,6 +376,22 @@ def _advection_diagnostics(
             raw_covariances[:, 0] - raw_covariances[:, 1],
             absolute=True,
         )
+    if joint_covariance is not None and np.asarray(joint_covariance).size > 0:
+        joint_covariance = np.asarray(joint_covariance, dtype=np.float64)
+        eigvals = np.linalg.eigvalsh(joint_covariance)
+        diagnostics["joint_covariance"] = {
+            "shape": list(joint_covariance.shape),
+            "trace": _stat_summary(np.trace(joint_covariance, axis1=-2, axis2=-1)),
+            "min_eigenvalue": _stat_summary(eigvals[..., 0]),
+            "max_eigenvalue": _stat_summary(eigvals[..., -1]),
+            "condition_number": _stat_summary(eigvals[..., -1] / np.clip(eigvals[..., 0], 1.0e-12, None)),
+        }
+        if joint_covariance.shape[-2:] == (4, 4):
+            cross_block = joint_covariance[:, 0:2, 2:4]
+            diagnostics["joint_covariance"]["u_v_cross_block_abs"] = _stat_summary(cross_block, absolute=True)
+            diagnostics["joint_covariance"]["u_v_cross_block_frobenius_norm"] = _stat_summary(
+                np.linalg.norm(cross_block, axis=(-2, -1))
+            )
     return diagnostics
 
 
@@ -773,6 +790,26 @@ def _export_advection_csv(
                 writer.writerow([t, component_name, cov[0, 0], cov[0, 1], cov[1, 0], cov[1, 1]])
 
 
+def _export_joint_advection_covariance_csv(
+    export_dir: Path,
+    joint_covariance: np.ndarray,
+    component_names: list[str],
+) -> None:
+    if joint_covariance.size == 0:
+        return
+
+    axes = ["x", "y"]
+    labels = [f"{component}_{axis}" for component in component_names for axis in axes]
+    path = export_dir / "joint_advection_covariances.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["time_index", "row_index", "row_label", "col_index", "col_label", "value"])
+        for t in range(joint_covariance.shape[0]):
+            for row_idx, row_label in enumerate(labels):
+                for col_idx, col_label in enumerate(labels):
+                    writer.writerow([t, row_idx, row_label, col_idx, col_label, joint_covariance[t, row_idx, col_idx]])
+
+
 def _export_transition_csv(export_dir: Path, transition: np.ndarray, labels: list[str]) -> None:
     path = export_dir / "transition_matrix_long.csv"
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -1060,6 +1097,7 @@ def export_window_diagnostics(
     filtered_denorm = _to_numpy(bundle.obs_scaler.inverse_transform(outputs["filtered_mean"]))
     means = _to_numpy(outputs["means"])
     covariances = _to_numpy(outputs["covariances"])
+    joint_covariance = _to_numpy(outputs["joint_covariance"]) if "joint_covariance" in outputs else None
     raw_means = _to_numpy(outputs["component_raw_means"]) if "component_raw_means" in outputs else None
     raw_covariances = (
         _to_numpy(outputs["component_raw_covariances"]) if "component_raw_covariances" in outputs else None
@@ -1115,12 +1153,16 @@ def export_window_diagnostics(
         arrays["component_raw_means"] = raw_means
     if raw_covariances is not None:
         arrays["component_raw_covariances"] = raw_covariances
+    if joint_covariance is not None:
+        arrays["joint_advection_covariance"] = joint_covariance
 
     np.savez_compressed(export_dir / "diagnostics_arrays.npz", **arrays)
     np.save(export_dir / "transition_matrices.npy", transition)
     np.save(export_dir / "kernel_transition_matrices.npy", kernel_transition)
     np.save(export_dir / "advection_means.npy", means)
     np.save(export_dir / "advection_covariances.npy", covariances)
+    if joint_covariance is not None:
+        np.save(export_dir / "joint_advection_covariances.npy", joint_covariance)
     np.save(export_dir / "forcing.npy", forcing)
 
     parameter_arrays, parameter_summary = _collect_parameter_snapshot(model)
@@ -1128,6 +1170,8 @@ def export_window_diagnostics(
     _write_json(export_dir / "parameter_summary.json", parameter_summary)
 
     _export_advection_csv(export_dir, means, covariances, config["data"]["component_names"])
+    if joint_covariance is not None:
+        _export_joint_advection_covariance_csv(export_dir, joint_covariance, config["data"]["component_names"])
     _export_transition_csv(export_dir, transition, bundle.feature_names)
 
     predicted_metrics = _compute_error_metrics(predicted_denorm, obs_denorm, bundle.feature_names)
@@ -1186,6 +1230,7 @@ def export_window_diagnostics(
         component_names=config["data"]["component_names"],
         raw_means=raw_means,
         raw_covariances=raw_covariances,
+        joint_covariance=joint_covariance,
     )
     forcing_parameter_diagnostics = _forcing_diagnostics(forcing)
     diagnostic_findings = _build_findings(
@@ -1216,6 +1261,7 @@ def export_window_diagnostics(
         "advection_shapes": {
             "means": list(means.shape),
             "covariances": list(covariances.shape),
+            "joint_covariance": list(joint_covariance.shape) if joint_covariance is not None else None,
             "forcing": list(forcing.shape),
             "drift_terms": list(drift_terms.shape),
             "dispersion_terms": list(dispersion_terms.shape),
@@ -1227,6 +1273,7 @@ def export_window_diagnostics(
             "kernel_mix": kernel_mix,
             "residual_gate": residual_gate,
             "identity_mix": identity_mix,
+            "row_normalize_dynamics": bool(float(_to_numpy(outputs.get("row_normalize_dynamics", 0.0)).reshape(-1)[0])),
             "component_mask": _to_numpy(outputs["component_mask"]).tolist(),
         },
         "predicted_metrics": predicted_metrics,
@@ -1247,6 +1294,12 @@ def export_window_diagnostics(
             "parameter_summary": str(export_dir / "parameter_summary.json"),
             "advection_means_csv": str(export_dir / "advection_means.csv"),
             "advection_covariances_csv": str(export_dir / "advection_covariances.csv"),
+            "joint_advection_covariances_npy": str(export_dir / "joint_advection_covariances.npy")
+            if joint_covariance is not None
+            else None,
+            "joint_advection_covariances_csv": str(export_dir / "joint_advection_covariances.csv")
+            if joint_covariance is not None
+            else None,
             "transition_csv": str(export_dir / "transition_matrix_long.csv"),
             "diagnostic_summary": str(export_dir / "diagnostic_summary.json"),
             "validation_summary": str(export_dir / "validation_summary.json"),
