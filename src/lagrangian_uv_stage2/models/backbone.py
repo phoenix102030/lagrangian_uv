@@ -22,7 +22,10 @@ def _raw_to_spd(raw: torch.Tensor, matrix_dim: int, sigma_floor: float) -> torch
     if raw.shape[-1] != expected_params:
         raise ValueError(f"Expected the last dimension to have size {expected_params}, got shape {raw.shape}.")
 
-    raw = _sanitize_tensor(raw)
+    # Keep Cholesky/covariance construction out of AMP half precision. Some
+    # CUDA ops promote softplus to fp32 under autocast, and the kernel algebra
+    # downstream is intentionally fp32 for stability anyway.
+    raw = _sanitize_tensor(raw).to(dtype=torch.float32)
     chol = raw.new_zeros(*raw.shape[:-1], matrix_dim, matrix_dim)
     tril_row, tril_col = torch.tril_indices(matrix_dim, matrix_dim, device=raw.device)
     chol[..., tril_row, tril_col] = raw
