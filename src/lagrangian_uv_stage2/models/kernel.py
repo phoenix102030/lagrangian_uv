@@ -142,14 +142,20 @@ class StochasticAdvectionKernel(nn.Module):
         covariances: torch.Tensor,
         site_coords: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # AMP autocast can make means/covariances float16. Keep the small
+        # kernel linear algebra in float32: CUDA cholesky_ex is not implemented
+        # for float16 on many PyTorch/CUDA builds, and these 2x2 inverses are
+        # numerically sensitive anyway. The CNN/GRU can still run with AMP.
         num_steps = means.shape[0]
-        means = _sanitize_vector(means)
-        covariances = _sanitize_matrix(covariances)
+        kernel_dtype = torch.float32
+        means = _sanitize_vector(means.to(dtype=kernel_dtype))
+        covariances = _sanitize_matrix(covariances.to(dtype=kernel_dtype))
+        site_coords = site_coords.to(device=means.device, dtype=kernel_dtype)
         spatial_lags = _sanitize_vector(site_coords.unsqueeze(1) - site_coords.unsqueeze(0))
-        block_scales = self._block_scales().to(means.device, means.dtype)
-        component_mask = self.component_mask.to(means.device, means.dtype)
-        identity_mix = self._identity_mix().to(means.device, means.dtype)
-        eye2 = torch.eye(2, device=means.device, dtype=means.dtype)
+        block_scales = self._block_scales().to(means.device, kernel_dtype)
+        component_mask = self.component_mask.to(means.device, kernel_dtype)
+        identity_mix = self._identity_mix().to(means.device, kernel_dtype)
+        eye2 = torch.eye(2, device=means.device, dtype=kernel_dtype)
 
         transitions = []
         drift_terms = []
