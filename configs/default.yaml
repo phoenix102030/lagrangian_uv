@@ -122,7 +122,9 @@ training:
   amp_dtype: float16
   use_ddp: true
   ddp_backend: nccl
-  find_unused_parameters: false
+  # Needed during ablations where only kernel_one_step_loss is active;
+  # otherwise DDP errors on forcing/Kalman/covariance parameters that do not receive gradients.
+  find_unused_parameters: true
   use_data_parallel: false
   allow_tf32: true
   cudnn_benchmark: true
