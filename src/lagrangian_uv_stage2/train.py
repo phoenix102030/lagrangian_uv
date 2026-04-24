@@ -20,6 +20,16 @@ from .data import build_data_bundle, serialize_scalers
 from .models.state_space import Stage2LagrangianStateSpaceModel
 
 
+LOSS_METRIC_KEYS = (
+    "loss",
+    "negative_log_likelihood",
+    "normalized_negative_log_likelihood",
+    "one_step_forecast_loss",
+    "rollout_forecast_loss",
+    "kernel_one_step_loss",
+)
+
+
 def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -129,10 +139,47 @@ def _compute_batch_loss(
     batch: dict[str, Any],
     device: torch.device,
 ) -> torch.Tensor:
+    loss, _ = _compute_batch_loss_and_metrics(model, batch, device)
+    return loss
+
+
+def _compute_batch_loss_and_metrics(
+    model: Stage2LagrangianStateSpaceModel,
+    batch: dict[str, Any],
+    device: torch.device,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     observations, nwp_u, nwp_v = _move_batch_to_device(batch, device)
     outputs = model(observations, nwp_u, nwp_v)
     loss = outputs["loss"]
-    return loss.mean() if loss.ndim > 0 else loss
+    loss = loss.mean() if loss.ndim > 0 else loss
+    metrics = {"loss": loss}
+    for key in LOSS_METRIC_KEYS:
+        if key in outputs:
+            value = outputs[key]
+            metrics[key] = value.mean() if value.ndim > 0 else value
+    return loss, metrics
+
+
+def _add_loss_metrics(
+    sums: dict[str, float],
+    counts: dict[str, int],
+    metrics: dict[str, torch.Tensor],
+) -> None:
+    for key, value in metrics.items():
+        if not torch.isfinite(value):
+            continue
+        sums[key] = sums.get(key, 0.0) + float(value.detach().cpu())
+        counts[key] = counts.get(key, 0) + 1
+
+
+def _distributed_metric_means(
+    sums: dict[str, float],
+    counts: dict[str, int],
+    device: torch.device,
+    context: DistributedContext,
+) -> dict[str, float]:
+    keys = sorted(set(sums) | set(counts))
+    return {key: _distributed_mean(sums.get(key, 0.0), counts.get(key, 0), device, context) for key in keys}
 
 
 def _unwrap_model(model: Stage2LagrangianStateSpaceModel) -> Stage2LagrangianStateSpaceModel:
@@ -169,18 +216,17 @@ def _evaluate_loader(
     context: DistributedContext,
     amp_enabled: bool = False,
     amp_dtype: str = "float16",
-) -> float:
+) -> dict[str, float]:
     model.eval()
-    local_loss_sum = 0.0
-    local_loss_count = 0
+    local_metric_sums: dict[str, float] = {}
+    local_metric_counts: dict[str, int] = {}
     with torch.inference_mode():
         for batch in loader:
             with _autocast_context(device, amp_enabled, amp_dtype):
-                loss = _compute_batch_loss(model, batch, device)
+                loss, metrics = _compute_batch_loss_and_metrics(model, batch, device)
             if torch.isfinite(loss):
-                local_loss_sum += float(loss.detach().cpu())
-                local_loss_count += 1
-    return _distributed_mean(local_loss_sum, local_loss_count, device, context)
+                _add_loss_metrics(local_metric_sums, local_metric_counts, metrics)
+    return _distributed_metric_means(local_metric_sums, local_metric_counts, device, context)
 
 
 def train(config: dict[str, Any]) -> Path:
@@ -306,8 +352,12 @@ def train(config: dict[str, Any]) -> Path:
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
 
-            local_loss_sum = 0.0
-            local_loss_count = 0
+            local_metric_sums: dict[str, float] = {}
+            local_metric_counts: dict[str, int] = {}
+            local_grad_norm_sum = 0.0
+            local_grad_norm_max = 0.0
+            local_grad_norm_count = 0
+            local_optimizer_steps = 0
             bad_batch_count = 0
             optimizer.zero_grad(set_to_none=True)
 
@@ -321,7 +371,7 @@ def train(config: dict[str, Any]) -> Path:
 
                 with sync_context:
                     with _autocast_context(device, amp_enabled, amp_dtype):
-                        loss = _compute_batch_loss(model, batch, device)
+                        loss, metrics = _compute_batch_loss_and_metrics(model, batch, device)
 
                     skip_loss = _distributed_any(not torch.isfinite(loss), device, context)
                     if skip_loss:
@@ -357,16 +407,22 @@ def train(config: dict[str, Any]) -> Path:
                             raise RuntimeError("Too many non-finite batches in one epoch.")
                         continue
 
-                    clip_grad_norm_(
+                    grad_norm = clip_grad_norm_(
                         model.parameters(),
                         max_norm=float(config["training"]["gradient_clip_norm"]),
                         error_if_nonfinite=False,
                     )
+                    if torch.isfinite(grad_norm):
+                        grad_norm_value = float(grad_norm.detach().cpu())
+                        local_grad_norm_sum += grad_norm_value
+                        local_grad_norm_max = max(local_grad_norm_max, grad_norm_value)
+                        local_grad_norm_count += 1
                     if grad_scaler is not None:
                         grad_scaler.step(optimizer)
                         grad_scaler.update()
                     else:
                         optimizer.step()
+                    local_optimizer_steps += 1
 
                     bad_param_name = _first_bad_parameter(_unwrap_model(model))
                     skip_param = _distributed_any(bad_param_name is not None, device, context)
@@ -380,21 +436,49 @@ def train(config: dict[str, Any]) -> Path:
                         continue
                     optimizer.zero_grad(set_to_none=True)
 
-                local_loss_sum += float(loss.detach().cpu())
-                local_loss_count += 1
+                _add_loss_metrics(local_metric_sums, local_metric_counts, metrics)
 
-            train_loss = _distributed_mean(local_loss_sum, local_loss_count, device, context)
-            val_loss = (
+            train_metrics = _distributed_metric_means(local_metric_sums, local_metric_counts, device, context)
+            train_loss = train_metrics.get("loss", float("nan"))
+            val_metrics = (
                 _evaluate_loader(model, val_loader, device, context, amp_enabled, amp_dtype)
                 if len(bundle.val_dataset) > 0
-                else float("nan")
+                else {"loss": float("nan")}
             )
+            val_loss = val_metrics.get("loss", float("nan"))
+            grad_norm_mean = _distributed_mean(local_grad_norm_sum, local_grad_norm_count, device, context)
+            grad_norm_max = local_grad_norm_max
+            if context.enabled:
+                grad_norm_max_tensor = torch.tensor(grad_norm_max, device=device, dtype=torch.float64)
+                dist.all_reduce(grad_norm_max_tensor, op=dist.ReduceOp.MAX)
+                grad_norm_max = float(grad_norm_max_tensor.item())
 
             if _is_main_process(context):
-                history.append({"epoch": float(epoch), "train_loss": train_loss, "val_loss": val_loss})
+                history_entry = {
+                    "epoch": float(epoch),
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "optimizer_steps": float(local_optimizer_steps),
+                    "grad_norm_mean": grad_norm_mean,
+                    "grad_norm_max": grad_norm_max,
+                }
+                for key, value in train_metrics.items():
+                    history_entry[f"train_{key}"] = value
+                for key, value in val_metrics.items():
+                    history_entry[f"val_{key}"] = value
+                history.append(history_entry)
 
                 if epoch % int(config["training"]["log_every"]) == 0:
-                    print(f"epoch={epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
+                    train_nll = train_metrics.get("negative_log_likelihood", float("nan"))
+                    train_one = train_metrics.get("one_step_forecast_loss", float("nan"))
+                    train_roll = train_metrics.get("rollout_forecast_loss", float("nan"))
+                    train_kernel = train_metrics.get("kernel_one_step_loss", float("nan"))
+                    print(
+                        f"epoch={epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
+                        f"steps={local_optimizer_steps} grad_norm={grad_norm_mean:.3e}/{grad_norm_max:.3e} "
+                        f"train_nll={train_nll:.6f} train_one={train_one:.6f} "
+                        f"train_roll={train_roll:.6f} train_kernel={train_kernel:.6f}"
+                    )
 
                 checkpoint = {
                     "model_state": _unwrap_model(model).state_dict(),

@@ -353,6 +353,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         if observations.ndim == 3:
             losses = []
             negative_log_likelihoods = []
+            normalized_negative_log_likelihoods = []
             one_step_losses = []
             rollout_losses = []
             kernel_one_step_losses = []
@@ -364,6 +365,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 )
                 losses.append(outputs["loss"])
                 negative_log_likelihoods.append(outputs["negative_log_likelihood"])
+                normalized_negative_log_likelihoods.append(outputs["normalized_negative_log_likelihood"])
                 one_step_losses.append(outputs["one_step_forecast_loss"])
                 rollout_losses.append(outputs["rollout_forecast_loss"])
                 kernel_one_step_losses.append(outputs["kernel_one_step_loss"])
@@ -371,6 +373,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             return {
                 "loss": torch.stack(losses, dim=0).mean(),
                 "negative_log_likelihood": torch.stack(negative_log_likelihoods, dim=0).mean(),
+                "normalized_negative_log_likelihood": torch.stack(normalized_negative_log_likelihoods, dim=0).mean(),
                 "one_step_forecast_loss": torch.stack(one_step_losses, dim=0).mean(),
                 "rollout_forecast_loss": torch.stack(rollout_losses, dim=0).mean(),
                 "kernel_one_step_loss": torch.stack(kernel_one_step_losses, dim=0).mean(),
