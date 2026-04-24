@@ -23,6 +23,11 @@ def main() -> None:
     parser.add_argument("--forecast-horizon", type=int, default=None, help="Optional forecast horizon override.")
     parser.add_argument("--stride", type=int, default=None, help="Optional stride override.")
     parser.add_argument("--output-json", default=None, help="Optional path to save the rolling forecast summary as JSON.")
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Print additional forecast diagnostics for damping, bias, and transition block structure.",
+    )
     args = parser.parse_args()
 
     results = rolling_forecast_from_checkpoint(
@@ -60,6 +65,40 @@ def main() -> None:
             f"persistence={float(persistence_mae):.6f}"
         )
 
+    if args.diagnostics:
+        diagnostics = results.get("rolling_diagnostics", {})
+        print("Rolling diagnostics:")
+        print(f"  Number of rolls: {diagnostics.get('num_rolls', 0)}")
+        print(
+            "  Model beats persistence fraction: "
+            f"{diagnostics.get('model_beats_persistence_fraction', 0.0):.3f}"
+        )
+        transition_diag = diagnostics.get("forecast_transition", {})
+        row_sum = transition_diag.get("row_sum", {})
+        if row_sum:
+            print(
+                "  Forecast dynamics row sum: "
+                f"mean={row_sum.get('mean', 0.0):.6f} "
+                f"min={row_sum.get('min', 0.0):.6f} "
+                f"max={row_sum.get('max', 0.0):.6f}"
+            )
+        cross_blocks = {
+            key: value
+            for key, value in transition_diag.get("blocks", {}).items()
+            if "_to_" in key and key.split("_to_")[0] != key.split("_to_")[1]
+        }
+        if cross_blocks:
+            formatted = ", ".join(
+                f"{key} mean_abs={block['mean_abs']:.3e}" for key, block in sorted(cross_blocks.items())
+            )
+            print(f"  Forecast dynamics cross-component blocks: {formatted}")
+        print("  Forecast/target std ratio by state dimension:")
+        for feature_name in results["feature_names"]:
+            ratio = diagnostics.get("forecast_to_target_std_ratio_by_feature", {}).get(feature_name, 0.0)
+            bias = diagnostics.get("model_bias_by_feature", {}).get(feature_name, 0.0)
+            win_rate = diagnostics.get("model_beats_persistence_fraction_by_feature", {}).get(feature_name, 0.0)
+            print(f"    {feature_name}: std_ratio={ratio:.3f} bias={bias:.6f} win_rate={win_rate:.3f}")
+
     if args.output_json:
         output_path = Path(args.output_json).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -77,6 +116,7 @@ def main() -> None:
                 "persistence_mae": [float(value) for value in results["horizon_metrics"]["persistence_mae"]],
                 "persistence_rmse": [float(value) for value in results["horizon_metrics"]["persistence_rmse"]],
             },
+            "rolling_diagnostics": results.get("rolling_diagnostics", {}),
         }
         output_path.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
         print(f"Saved summary JSON to {output_path}")

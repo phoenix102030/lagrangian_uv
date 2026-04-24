@@ -120,6 +120,370 @@ def _compute_persistence_comparison(
     }
 
 
+def _stat_summary(values: np.ndarray, absolute: bool = False) -> dict[str, float]:
+    array = np.asarray(values, dtype=np.float64)
+    if absolute:
+        array = np.abs(array)
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        return {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "p05": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+        }
+    return {
+        "mean": float(np.mean(finite)),
+        "std": float(np.std(finite)),
+        "min": float(np.min(finite)),
+        "p05": float(np.percentile(finite, 5)),
+        "p50": float(np.percentile(finite, 50)),
+        "p95": float(np.percentile(finite, 95)),
+        "max": float(np.max(finite)),
+    }
+
+
+def _component_slices(feature_names: list[str], component_names: list[str]) -> dict[str, slice]:
+    num_components = len(component_names)
+    if num_components <= 0 or len(feature_names) % num_components != 0:
+        return {}
+    num_sites = len(feature_names) // num_components
+    return {
+        component_name: slice(component_idx * num_sites, (component_idx + 1) * num_sites)
+        for component_idx, component_name in enumerate(component_names)
+    }
+
+
+def _matrix_structural_diagnostics(
+    matrix: np.ndarray,
+    feature_names: list[str],
+    component_names: list[str],
+    zero_tolerance: float = 1.0e-8,
+) -> dict[str, Any]:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.ndim == 2:
+        matrix = matrix[None, ...]
+    if matrix.ndim != 3:
+        raise ValueError(f"Expected matrix diagnostics input with shape [time, dim, dim], got {matrix.shape}.")
+
+    row_sums = matrix.sum(axis=-1)
+    row_abs_sums = np.abs(matrix).sum(axis=-1)
+    diagonal = np.diagonal(matrix, axis1=-2, axis2=-1)
+    spectral_radius = []
+    for matrix_t in matrix:
+        try:
+            spectral_radius.append(float(np.max(np.abs(np.linalg.eigvals(matrix_t)))))
+        except np.linalg.LinAlgError:
+            spectral_radius.append(float("nan"))
+
+    diagnostics: dict[str, Any] = {
+        "shape": list(matrix.shape),
+        "row_sum": _stat_summary(row_sums),
+        "row_abs_sum": _stat_summary(row_abs_sums),
+        "row_sum_deficit_from_one": _stat_summary(1.0 - row_sums),
+        "diagonal": _stat_summary(diagonal),
+        "off_diagonal_abs": _stat_summary(matrix - np.eye(matrix.shape[-1])[None, ...] * diagonal[..., None], absolute=True),
+        "spectral_radius": _stat_summary(np.asarray(spectral_radius, dtype=np.float64)),
+        "nonzero_fraction": float(np.mean(np.abs(matrix) > zero_tolerance)),
+    }
+
+    slices = _component_slices(feature_names, component_names)
+    if slices:
+        blocks: dict[str, Any] = {}
+        for row_component, row_slice in slices.items():
+            for col_component, col_slice in slices.items():
+                block = matrix[:, row_slice, col_slice]
+                key = f"{col_component}_to_{row_component}"
+                blocks[key] = {
+                    "value": _stat_summary(block),
+                    "abs": _stat_summary(block, absolute=True),
+                    "mean_abs": float(np.mean(np.abs(block))),
+                    "max_abs": float(np.max(np.abs(block))),
+                    "nonzero_fraction": float(np.mean(np.abs(block) > zero_tolerance)),
+                }
+        diagnostics["blocks"] = blocks
+        diagnostics["row_sum_by_component"] = {
+            component: _stat_summary(row_sums[:, component_slice])
+            for component, component_slice in slices.items()
+        }
+    return diagnostics
+
+
+def _inverse_transform_array(
+    scaled: np.ndarray,
+    bundle: DataBundle,
+) -> np.ndarray:
+    return _to_numpy(bundle.obs_scaler.inverse_transform(np.asarray(scaled, dtype=np.float32)))
+
+
+def _metric_with_scaled_and_denorm(
+    prediction_scaled: np.ndarray,
+    target_scaled: np.ndarray,
+    bundle: DataBundle,
+) -> dict[str, Any]:
+    prediction_denorm = _inverse_transform_array(prediction_scaled, bundle)
+    target_denorm = _inverse_transform_array(target_scaled, bundle)
+    return {
+        "scaled": _compute_error_metrics(prediction_scaled, target_scaled, bundle.feature_names),
+        "denormalized": _compute_error_metrics(prediction_denorm, target_denorm, bundle.feature_names),
+    }
+
+
+def _relative_improvement(model_mae: float, baseline_mae: float) -> float:
+    return 100.0 * (baseline_mae - model_mae) / max(float(baseline_mae), 1.0e-8)
+
+
+def _one_step_operator_diagnostics(
+    observations_scaled: np.ndarray,
+    transition: np.ndarray,
+    kernel_transition: np.ndarray,
+    persistence_matrix: np.ndarray,
+    forcing: np.ndarray,
+    bundle: DataBundle,
+) -> dict[str, Any]:
+    observations_scaled = np.asarray(observations_scaled, dtype=np.float32)
+    transition = np.asarray(transition, dtype=np.float32)
+    kernel_transition = np.asarray(kernel_transition, dtype=np.float32)
+    persistence_matrix = np.asarray(persistence_matrix, dtype=np.float32)
+    forcing = np.asarray(forcing, dtype=np.float32)
+
+    if observations_scaled.shape[0] < 2:
+        return {"available": False, "reason": "Need at least two timesteps for one-step diagnostics."}
+
+    prev = observations_scaled[:-1]
+    target = observations_scaled[1:]
+    transition_t = transition[1:]
+    kernel_t = kernel_transition[1:]
+    forcing_t = forcing[1:]
+
+    predictions = {
+        "raw_persistence": prev,
+        "learned_persistence_matrix": np.einsum("ij,tj->ti", persistence_matrix, prev),
+        "kernel_transition": np.einsum("tij,tj->ti", kernel_t, prev),
+        "dynamics_transition_without_forcing": np.einsum("tij,tj->ti", transition_t, prev),
+        "dynamics_transition_with_forcing": np.einsum("tij,tj->ti", transition_t, prev) + forcing_t,
+    }
+    baseline = _metric_with_scaled_and_denorm(predictions["raw_persistence"], target, bundle)
+    baseline_mae = baseline["denormalized"]["mae"]
+    diagnostics: dict[str, Any] = {
+        "available": True,
+        "baseline": "raw_persistence",
+        "metrics": {},
+    }
+
+    for name, prediction in predictions.items():
+        metrics = _metric_with_scaled_and_denorm(prediction, target, bundle)
+        metrics["mae_improvement_vs_raw_persistence_pct"] = _relative_improvement(
+            metrics["denormalized"]["mae"],
+            baseline_mae,
+        )
+        diagnostics["metrics"][name] = metrics
+
+    target_delta = target - prev
+    dynamics_delta = predictions["dynamics_transition_with_forcing"] - prev
+    diagnostics["delta_stats_scaled"] = {
+        "target_delta_abs": _stat_summary(target_delta, absolute=True),
+        "dynamics_delta_abs": _stat_summary(dynamics_delta, absolute=True),
+        "forcing_abs": _stat_summary(forcing_t, absolute=True),
+    }
+    return diagnostics
+
+
+def _kalman_uncertainty_diagnostics(
+    observations_scaled: np.ndarray,
+    predicted_mean_scaled: np.ndarray,
+    filtered_mean_scaled: np.ndarray,
+    predicted_covariance: np.ndarray,
+    filtered_covariance: np.ndarray,
+    feature_names: list[str],
+) -> dict[str, Any]:
+    observations_scaled = np.asarray(observations_scaled, dtype=np.float64)
+    predicted_mean_scaled = np.asarray(predicted_mean_scaled, dtype=np.float64)
+    filtered_mean_scaled = np.asarray(filtered_mean_scaled, dtype=np.float64)
+    predicted_covariance = np.asarray(predicted_covariance, dtype=np.float64)
+    filtered_covariance = np.asarray(filtered_covariance, dtype=np.float64)
+
+    pred_error = predicted_mean_scaled - observations_scaled
+    filt_error = filtered_mean_scaled - observations_scaled
+    pred_var = np.clip(np.diagonal(predicted_covariance, axis1=-2, axis2=-1), 1.0e-12, None)
+    filt_var = np.clip(np.diagonal(filtered_covariance, axis1=-2, axis2=-1), 1.0e-12, None)
+    pred_std = np.sqrt(pred_var)
+    filt_std = np.sqrt(filt_var)
+    pred_abs_error = np.abs(pred_error)
+    filt_abs_error = np.abs(filt_error)
+
+    return {
+        "predicted_std": _stat_summary(pred_std),
+        "filtered_std": _stat_summary(filt_std),
+        "filtered_to_predicted_variance_ratio": _stat_summary(filt_var / np.clip(pred_var, 1.0e-12, None)),
+        "predicted_coverage": {
+            "within_1sigma": float(np.mean(pred_abs_error <= pred_std)),
+            "within_2sigma": float(np.mean(pred_abs_error <= 2.0 * pred_std)),
+        },
+        "filtered_coverage": {
+            "within_1sigma": float(np.mean(filt_abs_error <= filt_std)),
+            "within_2sigma": float(np.mean(filt_abs_error <= 2.0 * filt_std)),
+        },
+        "predicted_std_per_feature": {
+            name: float(value) for name, value in zip(feature_names, np.mean(pred_std, axis=0))
+        },
+        "filtered_std_per_feature": {
+            name: float(value) for name, value in zip(feature_names, np.mean(filt_std, axis=0))
+        },
+    }
+
+
+def _advection_diagnostics(
+    means: np.ndarray,
+    covariances: np.ndarray,
+    component_names: list[str],
+    raw_means: np.ndarray | None = None,
+    raw_covariances: np.ndarray | None = None,
+) -> dict[str, Any]:
+    means = np.asarray(means, dtype=np.float64)
+    covariances = np.asarray(covariances, dtype=np.float64)
+    diagnostics: dict[str, Any] = {
+        "mean_norm": _stat_summary(np.linalg.norm(means, axis=-1)),
+        "covariance_trace": _stat_summary(np.trace(covariances, axis1=-2, axis2=-1)),
+        "components": {},
+    }
+    for component_idx, component_name in enumerate(component_names):
+        cov = covariances[:, component_idx]
+        eigvals = np.linalg.eigvalsh(cov)
+        diagnostics["components"][component_name] = {
+            "mu_x": _stat_summary(means[:, component_idx, 0]),
+            "mu_y": _stat_summary(means[:, component_idx, 1]),
+            "mu_norm": _stat_summary(np.linalg.norm(means[:, component_idx], axis=-1)),
+            "cov_trace": _stat_summary(np.trace(cov, axis1=-2, axis2=-1)),
+            "cov_min_eigenvalue": _stat_summary(eigvals[..., 0]),
+            "cov_max_eigenvalue": _stat_summary(eigvals[..., -1]),
+            "cov_condition_number": _stat_summary(eigvals[..., -1] / np.clip(eigvals[..., 0], 1.0e-12, None)),
+        }
+
+    if raw_means is not None:
+        raw_means = np.asarray(raw_means, dtype=np.float64)
+        diagnostics["raw_component_mean_abs_difference"] = _stat_summary(
+            raw_means[:, 0] - raw_means[:, 1],
+            absolute=True,
+        )
+    if raw_covariances is not None:
+        raw_covariances = np.asarray(raw_covariances, dtype=np.float64)
+        diagnostics["raw_component_covariance_abs_difference"] = _stat_summary(
+            raw_covariances[:, 0] - raw_covariances[:, 1],
+            absolute=True,
+        )
+    return diagnostics
+
+
+def _forcing_diagnostics(forcing: np.ndarray) -> dict[str, Any]:
+    forcing = np.asarray(forcing, dtype=np.float64)
+    return {
+        "abs": _stat_summary(forcing, absolute=True),
+        "l2_norm": _stat_summary(np.linalg.norm(forcing, axis=-1)),
+        "nonzero_fraction": float(np.mean(np.abs(forcing) > 1.0e-8)),
+    }
+
+
+def _build_findings(
+    config: dict[str, Any],
+    structural_diagnostics: dict[str, Any],
+    one_step_diagnostics: dict[str, Any],
+    predicted_metrics: dict[str, Any],
+    filtered_metrics: dict[str, Any],
+    persistence_comparison: dict[str, Any],
+    forcing_diagnostics: dict[str, Any],
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    allow_cross_component = bool(config["model"].get("allow_cross_component", False))
+    if not allow_cross_component:
+        findings.append(
+            {
+                "severity": "info",
+                "code": "cross_component_disabled",
+                "message": "model.allow_cross_component is false, so u/v cross-component transition blocks are masked to zero by design.",
+            }
+        )
+
+    transition_diag = structural_diagnostics.get("transition", {})
+    blocks = transition_diag.get("blocks", {})
+    cross_block_keys = [key for key in blocks if "_to_" in key and key.split("_to_")[0] != key.split("_to_")[1]]
+    if cross_block_keys and all(blocks[key]["max_abs"] <= 1.0e-8 for key in cross_block_keys):
+        findings.append(
+            {
+                "severity": "info",
+                "code": "cross_component_blocks_zero",
+                "message": "All cross-component transition blocks are numerically zero.",
+                "max_abs_by_block": {key: blocks[key]["max_abs"] for key in cross_block_keys},
+            }
+        )
+
+    row_sum_mean = transition_diag.get("row_sum", {}).get("mean")
+    if row_sum_mean is not None and row_sum_mean < 0.99:
+        horizon = int(config["evaluation"].get("forecast_horizon", 1))
+        findings.append(
+            {
+                "severity": "warning",
+                "code": "transition_row_sum_below_one",
+                "message": "The final dynamics matrix has row sums below one, so open-loop forecasts can be damped toward zero.",
+                "mean_row_sum": float(row_sum_mean),
+                "approx_gain_after_configured_horizon": float(row_sum_mean**horizon),
+            }
+        )
+
+    if one_step_diagnostics.get("available"):
+        metrics = one_step_diagnostics["metrics"]
+        persistence_mae = metrics["raw_persistence"]["denormalized"]["mae"]
+        dynamics_mae = metrics["dynamics_transition_with_forcing"]["denormalized"]["mae"]
+        kernel_mae = metrics["kernel_transition"]["denormalized"]["mae"]
+        if dynamics_mae > persistence_mae:
+            findings.append(
+                {
+                    "severity": "warning",
+                    "code": "dynamics_one_step_underperforms_persistence",
+                    "message": "Applying the learned dynamics to the previous true observation is worse than raw persistence on this window.",
+                    "dynamics_mae": float(dynamics_mae),
+                    "persistence_mae": float(persistence_mae),
+                }
+            )
+        if kernel_mae > persistence_mae:
+            findings.append(
+                {
+                    "severity": "warning",
+                    "code": "kernel_one_step_underperforms_persistence",
+                    "message": "The row-normalized kernel transition alone is worse than raw persistence on this window.",
+                    "kernel_mae": float(kernel_mae),
+                    "persistence_mae": float(persistence_mae),
+                }
+            )
+
+    persistence_model_mae = persistence_comparison["model_metrics_on_persistence_horizon"]["mae"]
+    persistence_mae = persistence_comparison["persistence_metrics"]["mae"]
+    if persistence_model_mae > persistence_mae and filtered_metrics["mae"] < predicted_metrics["mae"]:
+        findings.append(
+            {
+                "severity": "warning",
+                "code": "filter_update_hides_weak_prior",
+                "message": "Predicted means lose to persistence, but filtered means improve after observing the target; the Kalman update is doing most of the correction.",
+                "predicted_mae": float(predicted_metrics["mae"]),
+                "filtered_mae": float(filtered_metrics["mae"]),
+                "persistence_mae": float(persistence_mae),
+            }
+        )
+
+    if forcing_diagnostics["nonzero_fraction"] == 0.0:
+        findings.append(
+            {
+                "severity": "info",
+                "code": "forcing_zero",
+                "message": "Forcing is exactly zero for this run, so all forecast motion must come from the transition matrix.",
+            }
+        )
+    return findings
+
+
 def _select_sequence_window(
     bundle: DataBundle,
     config: dict[str, Any],
@@ -199,6 +563,9 @@ def rolling_forecast(
     forecast_collection = []
     target_collection = []
     persistence_collection = []
+    transition_collection = []
+    kernel_transition_collection = []
+    forcing_collection = []
     per_roll_mae = []
     per_roll_persistence_mae = []
 
@@ -232,6 +599,9 @@ def rolling_forecast(
         forecast_collection.append(forecast_denorm)
         target_collection.append(target_denorm)
         persistence_collection.append(persistence_denorm)
+        transition_collection.append(forecast["transition"].detach().cpu())
+        kernel_transition_collection.append(forecast["kernel_transition"].detach().cpu())
+        forcing_collection.append(forecast["forcing"].detach().cpu())
         per_roll_mae.append(mae)
         per_roll_persistence_mae.append(persistence_mae)
 
@@ -240,6 +610,9 @@ def rolling_forecast(
     stacked_forecast = torch.stack(forecast_collection, dim=0)
     stacked_target = torch.stack(target_collection, dim=0)
     stacked_persistence = torch.stack(persistence_collection, dim=0)
+    stacked_transition = torch.stack(transition_collection, dim=0)
+    stacked_kernel_transition = torch.stack(kernel_transition_collection, dim=0)
+    stacked_forcing = torch.stack(forcing_collection, dim=0)
 
     model_error_metrics = _compute_error_metrics(
         prediction=stacked_forecast.reshape(-1, stacked_forecast.shape[-1]).numpy(),
@@ -258,6 +631,54 @@ def rolling_forecast(
     horizon_persistence_rmse = torch.sqrt(((stacked_persistence - stacked_target) ** 2).mean(dim=(0, 2)))
     mae_base = max(persistence_error_metrics["mae"], 1.0e-8)
     rmse_base = max(persistence_error_metrics["rmse"], 1.0e-8)
+    model_abs_error = (stacked_forecast - stacked_target).abs()
+    persistence_abs_error = (stacked_persistence - stacked_target).abs()
+    win_mask = model_abs_error < persistence_abs_error
+    flat_forecast = stacked_forecast.reshape(-1, stacked_forecast.shape[-1])
+    flat_target = stacked_target.reshape(-1, stacked_target.shape[-1])
+    forecast_std = flat_forecast.std(dim=0, unbiased=False)
+    target_std = flat_target.std(dim=0, unbiased=False)
+    rolling_diagnostics = {
+        "num_rolls": int(stacked_forecast.shape[0]),
+        "model_beats_persistence_fraction": float(win_mask.float().mean()),
+        "model_beats_persistence_fraction_by_feature": {
+            name: float(value) for name, value in zip(bundle.feature_names, win_mask.float().mean(dim=(0, 1)))
+        },
+        "model_beats_persistence_fraction_by_horizon": [
+            float(value) for value in win_mask.float().mean(dim=(0, 2))
+        ],
+        "model_bias_by_feature": {
+            name: float(value) for name, value in zip(bundle.feature_names, (stacked_forecast - stacked_target).mean(dim=(0, 1)))
+        },
+        "model_error_mean_by_horizon": [
+            float(value) for value in (stacked_forecast - stacked_target).mean(dim=(0, 2))
+        ],
+        "forecast_std_by_feature": {
+            name: float(value) for name, value in zip(bundle.feature_names, forecast_std)
+        },
+        "target_std_by_feature": {
+            name: float(value) for name, value in zip(bundle.feature_names, target_std)
+        },
+        "forecast_to_target_std_ratio_by_feature": {
+            name: float(value)
+            for name, value in zip(bundle.feature_names, forecast_std / target_std.clamp_min(1.0e-8))
+        },
+        "forecast_transition": _matrix_structural_diagnostics(
+            stacked_transition.reshape(-1, stacked_transition.shape[-2], stacked_transition.shape[-1]).numpy(),
+            feature_names=bundle.feature_names,
+            component_names=config["data"]["component_names"],
+        ),
+        "forecast_kernel_transition": _matrix_structural_diagnostics(
+            stacked_kernel_transition.reshape(
+                -1,
+                stacked_kernel_transition.shape[-2],
+                stacked_kernel_transition.shape[-1],
+            ).numpy(),
+            feature_names=bundle.feature_names,
+            component_names=config["data"]["component_names"],
+        ),
+        "forecast_forcing": _forcing_diagnostics(stacked_forcing.numpy()),
+    }
     return {
         "feature_names": bundle.feature_names,
         "forecast_horizon": forecast_horizon,
@@ -280,6 +701,7 @@ def rolling_forecast(
             "persistence_mae": horizon_persistence_mae,
             "persistence_rmse": horizon_persistence_rmse,
         },
+        "rolling_diagnostics": rolling_diagnostics,
     }
 
 
@@ -638,6 +1060,10 @@ def export_window_diagnostics(
     filtered_denorm = _to_numpy(bundle.obs_scaler.inverse_transform(outputs["filtered_mean"]))
     means = _to_numpy(outputs["means"])
     covariances = _to_numpy(outputs["covariances"])
+    raw_means = _to_numpy(outputs["component_raw_means"]) if "component_raw_means" in outputs else None
+    raw_covariances = (
+        _to_numpy(outputs["component_raw_covariances"]) if "component_raw_covariances" in outputs else None
+    )
     drift_terms = _to_numpy(outputs["drift_terms"])
     dispersion_terms = _to_numpy(outputs["dispersion_terms"])
     transition = _to_numpy(outputs["transition"])
@@ -679,11 +1105,16 @@ def export_window_diagnostics(
         "process_covariance_matrix": q_matrix,
         "measurement_covariance_matrix": r_matrix,
         "block_scales": block_scales,
+        "component_mask": _to_numpy(outputs["component_mask"]),
         "identity_mix": np.asarray([identity_mix], dtype=np.float32),
         "initial_mean": initial_mean,
         "initial_covariance": initial_covariance,
         "site_coords": bundle.site_coords.astype(np.float32),
     }
+    if raw_means is not None:
+        arrays["component_raw_means"] = raw_means
+    if raw_covariances is not None:
+        arrays["component_raw_covariances"] = raw_covariances
 
     np.savez_compressed(export_dir / "diagnostics_arrays.npz", **arrays)
     np.save(export_dir / "transition_matrices.npy", transition)
@@ -706,6 +1137,66 @@ def export_window_diagnostics(
         target=obs_denorm,
         feature_names=bundle.feature_names,
     )
+    structural_diagnostics = {
+        "transition": _matrix_structural_diagnostics(
+            transition,
+            feature_names=bundle.feature_names,
+            component_names=config["data"]["component_names"],
+        ),
+        "kernel_transition": _matrix_structural_diagnostics(
+            kernel_transition,
+            feature_names=bundle.feature_names,
+            component_names=config["data"]["component_names"],
+        ),
+        "persistence_matrix": _matrix_structural_diagnostics(
+            persistence_matrix,
+            feature_names=bundle.feature_names,
+            component_names=config["data"]["component_names"],
+        ),
+        "process_covariance_matrix": _matrix_structural_diagnostics(
+            q_matrix,
+            feature_names=bundle.feature_names,
+            component_names=config["data"]["component_names"],
+        ),
+        "measurement_covariance_matrix": _matrix_structural_diagnostics(
+            r_matrix,
+            feature_names=bundle.feature_names,
+            component_names=config["data"]["component_names"],
+        ),
+    }
+    one_step_diagnostics = _one_step_operator_diagnostics(
+        observations_scaled=arrays["observations_scaled"],
+        transition=transition,
+        kernel_transition=kernel_transition,
+        persistence_matrix=persistence_matrix,
+        forcing=forcing,
+        bundle=bundle,
+    )
+    uncertainty_diagnostics = _kalman_uncertainty_diagnostics(
+        observations_scaled=arrays["observations_scaled"],
+        predicted_mean_scaled=arrays["predicted_mean_scaled"],
+        filtered_mean_scaled=arrays["filtered_mean_scaled"],
+        predicted_covariance=arrays["predicted_covariance"],
+        filtered_covariance=arrays["filtered_covariance"],
+        feature_names=bundle.feature_names,
+    )
+    advection_parameter_diagnostics = _advection_diagnostics(
+        means=means,
+        covariances=covariances,
+        component_names=config["data"]["component_names"],
+        raw_means=raw_means,
+        raw_covariances=raw_covariances,
+    )
+    forcing_parameter_diagnostics = _forcing_diagnostics(forcing)
+    diagnostic_findings = _build_findings(
+        config=config,
+        structural_diagnostics=structural_diagnostics,
+        one_step_diagnostics=one_step_diagnostics,
+        predicted_metrics=predicted_metrics,
+        filtered_metrics=filtered_metrics,
+        persistence_comparison=persistence_comparison,
+        forcing_diagnostics=forcing_parameter_diagnostics,
+    )
 
     summary = {
         **metadata,
@@ -719,6 +1210,7 @@ def export_window_diagnostics(
             ),
             "one_step_forecast_loss": float(_to_numpy(outputs["one_step_forecast_loss"]).reshape(-1)[0]),
             "rollout_forecast_loss": float(_to_numpy(outputs["rollout_forecast_loss"]).reshape(-1)[0]),
+            "kernel_one_step_loss": float(_to_numpy(outputs["kernel_one_step_loss"]).reshape(-1)[0]),
         },
         "negative_log_likelihood": float(_to_numpy(outputs["negative_log_likelihood"]).reshape(-1)[0]),
         "advection_shapes": {
@@ -735,10 +1227,17 @@ def export_window_diagnostics(
             "kernel_mix": kernel_mix,
             "residual_gate": residual_gate,
             "identity_mix": identity_mix,
+            "component_mask": _to_numpy(outputs["component_mask"]).tolist(),
         },
         "predicted_metrics": predicted_metrics,
         "filtered_metrics": filtered_metrics,
         "persistence_comparison": persistence_comparison,
+        "structural_diagnostics": structural_diagnostics,
+        "one_step_operator_diagnostics": one_step_diagnostics,
+        "kalman_uncertainty_diagnostics": uncertainty_diagnostics,
+        "advection_parameter_diagnostics": advection_parameter_diagnostics,
+        "forcing_diagnostics": forcing_parameter_diagnostics,
+        "diagnostic_findings": diagnostic_findings,
         "files": {
             "arrays": str(export_dir / "diagnostics_arrays.npz"),
             "transitions_npy": str(export_dir / "transition_matrices.npy"),

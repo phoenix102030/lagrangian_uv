@@ -1,7 +1,14 @@
-python -m scripts.export_diagnostics    --config configs/default.yaml   --checkpoint outputs/stage2_uv_02/best.pt   --split val    --window-index 0
+python -m scripts.export_diagnostics \
+  --config configs/default.yaml \
+  --checkpoint outputs/stage2_uv_02/best.pt \
+  --split val \
+  --window-index 0
 
-python scripts/rolling_forecast.py   --config configs/default.yaml   --checkpoint outputs/stage2_uv/best.pt
-
+python scripts/rolling_forecast.py \
+  --config configs/default.yaml \
+  --checkpoint outputs/stage2_uv_02/best.pt \
+  --diagnostics \
+  --output-json outputs/stage2_uv_02/rolling_diagnostics.json
 # Lagrangian UV Stage-2
 
 This is a clean, isolated reimplementation of the original DeepMIDE idea for the second-stage kernel you described.

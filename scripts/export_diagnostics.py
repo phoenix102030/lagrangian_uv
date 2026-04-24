@@ -53,6 +53,51 @@ def main() -> None:
         f"MAE={summary['persistence_comparison']['improvement_vs_persistence_pct']['mae']:.2f}% "
         f"RMSE={summary['persistence_comparison']['improvement_vs_persistence_pct']['rmse']:.2f}%"
     )
+    transition_diag = summary.get("structural_diagnostics", {}).get("transition", {})
+    kernel_diag = summary.get("structural_diagnostics", {}).get("kernel_transition", {})
+    if transition_diag:
+        row_sum = transition_diag.get("row_sum", {})
+        print(
+            "  Dynamics row sum: "
+            f"mean={row_sum.get('mean', 0.0):.6f} "
+            f"min={row_sum.get('min', 0.0):.6f} "
+            f"max={row_sum.get('max', 0.0):.6f}"
+        )
+        cross_blocks = {
+            key: value
+            for key, value in transition_diag.get("blocks", {}).items()
+            if "_to_" in key and key.split("_to_")[0] != key.split("_to_")[1]
+        }
+        if cross_blocks:
+            formatted = ", ".join(
+                f"{key} mean_abs={block['mean_abs']:.3e}" for key, block in sorted(cross_blocks.items())
+            )
+            print(f"  Dynamics cross-component blocks: {formatted}")
+    if kernel_diag:
+        row_sum = kernel_diag.get("row_sum", {})
+        print(
+            "  Kernel row sum: "
+            f"mean={row_sum.get('mean', 0.0):.6f} "
+            f"min={row_sum.get('min', 0.0):.6f} "
+            f"max={row_sum.get('max', 0.0):.6f}"
+        )
+    operator_diag = summary.get("one_step_operator_diagnostics", {})
+    if operator_diag.get("available"):
+        metrics = operator_diag["metrics"]
+        persistence_mae = metrics["raw_persistence"]["denormalized"]["mae"]
+        dynamics_mae = metrics["dynamics_transition_with_forcing"]["denormalized"]["mae"]
+        kernel_mae = metrics["kernel_transition"]["denormalized"]["mae"]
+        print(
+            "  One-step operator MAE: "
+            f"persistence={persistence_mae:.6f} "
+            f"kernel={kernel_mae:.6f} "
+            f"dynamics={dynamics_mae:.6f}"
+        )
+    findings = summary.get("diagnostic_findings", [])
+    if findings:
+        print("  Diagnostic findings:")
+        for finding in findings[:8]:
+            print(f"    [{finding.get('severity', 'info')}] {finding.get('code', 'diagnostic')}: {finding.get('message', '')}")
     print(f"  Diagnostic summary: {summary['files']['diagnostic_summary']}")
     print(f"  Array archive: {summary['files']['arrays']}")
     print("  Generated plots:")
