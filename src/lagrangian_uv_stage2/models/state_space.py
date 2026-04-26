@@ -261,20 +261,32 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         normalized_nll = nll / float(self.state_dim) if self.normalize_nll_by_state_dim else nll
 
         if observations.shape[0] > 1:
+            one_step_error = outputs["predicted_mean"][1:] - observations[1:]
             one_step_loss = torch.nn.functional.smooth_l1_loss(outputs["predicted_mean"][1:], observations[1:])
+            one_step_mae = one_step_error.abs().mean()
+            one_step_rmse = torch.sqrt(torch.mean(one_step_error.square()).clamp_min(0.0))
         else:
             one_step_loss = zero
+            one_step_mae = zero
+            one_step_rmse = zero
 
         kernel_one_step_loss = zero
+        kernel_one_step_mae = zero
+        kernel_one_step_rmse = zero
         if self.kernel_one_step_weight > 0.0 and observations.shape[0] > 1 and "kernel_transition" in outputs:
             kernel_prediction = torch.einsum(
                 "tij,tj->ti",
                 outputs["kernel_transition"][1:].to(dtype=observations.dtype),
                 observations[:-1],
             )
+            kernel_error = kernel_prediction - observations[1:]
             kernel_one_step_loss = torch.nn.functional.smooth_l1_loss(kernel_prediction, observations[1:])
+            kernel_one_step_mae = kernel_error.abs().mean()
+            kernel_one_step_rmse = torch.sqrt(torch.mean(kernel_error.square()).clamp_min(0.0))
 
         rollout_loss = zero
+        rollout_mae = zero
+        rollout_rmse = zero
         rollout_horizon = min(self.forecast_loss_horizon, max(observations.shape[0] - self.forecast_loss_min_context, 0))
         if self.rollout_forecast_weight > 0.0 and rollout_horizon > 0:
             context_end = observations.shape[0] - rollout_horizon
@@ -288,7 +300,10 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                     teacher_forcing_ratio=self.scheduled_sampling_ratio if self.training else 0.0,
                 )
                 rollout_target = observations[context_end:]
+                rollout_error = rollout["forecast_mean"] - rollout_target
                 rollout_loss = torch.nn.functional.smooth_l1_loss(rollout["forecast_mean"], rollout_target)
+                rollout_mae = rollout_error.abs().mean()
+                rollout_rmse = torch.sqrt(torch.mean(rollout_error.square()).clamp_min(0.0))
 
         total_loss = (
             self.nll_weight * normalized_nll
@@ -300,8 +315,14 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             "negative_log_likelihood": nll,
             "normalized_negative_log_likelihood": normalized_nll,
             "one_step_forecast_loss": one_step_loss,
+            "one_step_mae": one_step_mae,
+            "one_step_rmse": one_step_rmse,
             "rollout_forecast_loss": rollout_loss,
+            "rollout_mae": rollout_mae,
+            "rollout_rmse": rollout_rmse,
             "kernel_one_step_loss": kernel_one_step_loss,
+            "kernel_one_step_mae": kernel_one_step_mae,
+            "kernel_one_step_rmse": kernel_one_step_rmse,
         }
 
     def _forward_single(
@@ -355,8 +376,14 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             negative_log_likelihoods = []
             normalized_negative_log_likelihoods = []
             one_step_losses = []
+            one_step_maes = []
+            one_step_rmses = []
             rollout_losses = []
+            rollout_maes = []
+            rollout_rmses = []
             kernel_one_step_losses = []
+            kernel_one_step_maes = []
+            kernel_one_step_rmses = []
             for batch_idx in range(observations.shape[0]):
                 outputs = self._forward_single(
                     observations=observations[batch_idx],
@@ -367,16 +394,28 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 negative_log_likelihoods.append(outputs["negative_log_likelihood"])
                 normalized_negative_log_likelihoods.append(outputs["normalized_negative_log_likelihood"])
                 one_step_losses.append(outputs["one_step_forecast_loss"])
+                one_step_maes.append(outputs["one_step_mae"])
+                one_step_rmses.append(outputs["one_step_rmse"])
                 rollout_losses.append(outputs["rollout_forecast_loss"])
+                rollout_maes.append(outputs["rollout_mae"])
+                rollout_rmses.append(outputs["rollout_rmse"])
                 kernel_one_step_losses.append(outputs["kernel_one_step_loss"])
+                kernel_one_step_maes.append(outputs["kernel_one_step_mae"])
+                kernel_one_step_rmses.append(outputs["kernel_one_step_rmse"])
 
             return {
                 "loss": torch.stack(losses, dim=0).mean(),
                 "negative_log_likelihood": torch.stack(negative_log_likelihoods, dim=0).mean(),
                 "normalized_negative_log_likelihood": torch.stack(normalized_negative_log_likelihoods, dim=0).mean(),
                 "one_step_forecast_loss": torch.stack(one_step_losses, dim=0).mean(),
+                "one_step_mae": torch.stack(one_step_maes, dim=0).mean(),
+                "one_step_rmse": torch.stack(one_step_rmses, dim=0).mean(),
                 "rollout_forecast_loss": torch.stack(rollout_losses, dim=0).mean(),
+                "rollout_mae": torch.stack(rollout_maes, dim=0).mean(),
+                "rollout_rmse": torch.stack(rollout_rmses, dim=0).mean(),
                 "kernel_one_step_loss": torch.stack(kernel_one_step_losses, dim=0).mean(),
+                "kernel_one_step_mae": torch.stack(kernel_one_step_maes, dim=0).mean(),
+                "kernel_one_step_rmse": torch.stack(kernel_one_step_rmses, dim=0).mean(),
             }
 
         raise ValueError(

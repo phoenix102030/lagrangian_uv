@@ -25,8 +25,14 @@ LOSS_METRIC_KEYS = (
     "negative_log_likelihood",
     "normalized_negative_log_likelihood",
     "one_step_forecast_loss",
+    "one_step_mae",
+    "one_step_rmse",
     "rollout_forecast_loss",
+    "rollout_mae",
+    "rollout_rmse",
     "kernel_one_step_loss",
+    "kernel_one_step_mae",
+    "kernel_one_step_rmse",
 )
 
 
@@ -473,11 +479,18 @@ def train(config: dict[str, Any]) -> Path:
                     train_one = train_metrics.get("one_step_forecast_loss", float("nan"))
                     train_roll = train_metrics.get("rollout_forecast_loss", float("nan"))
                     train_kernel = train_metrics.get("kernel_one_step_loss", float("nan"))
+                    train_one_rmse = train_metrics.get("one_step_rmse", float("nan"))
+                    train_roll_rmse = train_metrics.get("rollout_rmse", float("nan"))
+                    val_nll = val_metrics.get("negative_log_likelihood", float("nan"))
+                    val_one_rmse = val_metrics.get("one_step_rmse", float("nan"))
+                    val_roll_rmse = val_metrics.get("rollout_rmse", float("nan"))
                     print(
                         f"epoch={epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
                         f"steps={local_optimizer_steps} grad_norm={grad_norm_mean:.3e}/{grad_norm_max:.3e} "
                         f"train_nll={train_nll:.6f} train_one={train_one:.6f} "
-                        f"train_roll={train_roll:.6f} train_kernel={train_kernel:.6f}"
+                        f"train_roll={train_roll:.6f} train_kernel={train_kernel:.6f} "
+                        f"train_rmse={train_one_rmse:.6f}/{train_roll_rmse:.6f} "
+                        f"val_nll={val_nll:.6f} val_rmse={val_one_rmse:.6f}/{val_roll_rmse:.6f}"
                     )
 
                 checkpoint = {
