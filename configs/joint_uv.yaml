@@ -1,6 +1,6 @@
 project:
   seed: 9527
-  output_dir: ../outputs/stage2_uv_joint_forecast
+  output_dir: ../outputs/stage2_uv_joint_forcing
 
 data:
   site_names: [ E05, E06, ASOW6 ]
@@ -63,11 +63,11 @@ model:
   cross_component_scale_init: 0.10
   mean_scale: 2.0
   sigma_floor: 1e-3
-  forcing_scale: 0.0
-  persistence_init: 0.98
-  persistence_min: 0.70
+  forcing_scale: 0.05
+  persistence_init: 0.995
+  persistence_min: 0.90
   persistence_max: 1.0
-  kernel_mix_init: 0.30
+  kernel_mix_init: 0.10
   kernel_mix_min: 0.0
   kernel_mix_max: 1.0
 
@@ -124,7 +124,7 @@ training:
   amp_dtype: float16
   use_ddp: true
   ddp_backend: nccl
-  find_unused_parameters: true
+  find_unused_parameters: false
   use_data_parallel: false
   allow_tf32: true
   cudnn_benchmark: true

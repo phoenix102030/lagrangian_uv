@@ -384,6 +384,9 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             kernel_one_step_losses = []
             kernel_one_step_maes = []
             kernel_one_step_rmses = []
+            forcing_abs_means = []
+            kernel_mixes = []
+            persistence_means = []
             for batch_idx in range(observations.shape[0]):
                 outputs = self._forward_single(
                     observations=observations[batch_idx],
@@ -402,6 +405,9 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 kernel_one_step_losses.append(outputs["kernel_one_step_loss"])
                 kernel_one_step_maes.append(outputs["kernel_one_step_mae"])
                 kernel_one_step_rmses.append(outputs["kernel_one_step_rmse"])
+                forcing_abs_means.append(outputs["forcing"].abs().mean())
+                kernel_mixes.append(outputs["kernel_mix"].mean())
+                persistence_means.append(outputs["persistence_diagonal"].mean())
 
             return {
                 "loss": torch.stack(losses, dim=0).mean(),
@@ -416,6 +422,9 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 "kernel_one_step_loss": torch.stack(kernel_one_step_losses, dim=0).mean(),
                 "kernel_one_step_mae": torch.stack(kernel_one_step_maes, dim=0).mean(),
                 "kernel_one_step_rmse": torch.stack(kernel_one_step_rmses, dim=0).mean(),
+                "forcing_abs_mean": torch.stack(forcing_abs_means, dim=0).mean(),
+                "kernel_mix": torch.stack(kernel_mixes, dim=0).mean(),
+                "persistence_mean": torch.stack(persistence_means, dim=0).mean(),
             }
 
         raise ValueError(
