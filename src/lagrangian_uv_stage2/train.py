@@ -27,12 +27,15 @@ LOSS_METRIC_KEYS = (
     "one_step_forecast_loss",
     "one_step_mae",
     "one_step_rmse",
+    "one_step_skill_loss",
     "rollout_forecast_loss",
     "rollout_mae",
     "rollout_rmse",
+    "rollout_skill_loss",
     "kernel_one_step_loss",
     "kernel_one_step_mae",
     "kernel_one_step_rmse",
+    "persistence_skill_loss",
     "forcing_abs_mean",
     "kernel_mix",
     "persistence_mean",
@@ -496,6 +499,7 @@ def train(config: dict[str, Any]) -> Path:
                     forcing_abs = train_metrics.get("forcing_abs_mean", float("nan"))
                     kernel_mix = train_metrics.get("kernel_mix", float("nan"))
                     persistence_mean = train_metrics.get("persistence_mean", float("nan"))
+                    skill_loss = train_metrics.get("persistence_skill_loss", float("nan"))
                     print(
                         f"epoch={epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
                         f"steps={local_optimizer_steps} grad_norm={grad_norm_mean:.3e}/{grad_norm_max:.3e} "
@@ -504,7 +508,7 @@ def train(config: dict[str, Any]) -> Path:
                         f"train_rmse={train_one_rmse:.6f}/{train_roll_rmse:.6f} "
                         f"val_nll={val_nll:.6f} val_rmse={val_one_rmse:.6f}/{val_roll_rmse:.6f} "
                         f"forcing_abs={forcing_abs:.6f} kernel_mix={kernel_mix:.6f} "
-                        f"persistence={persistence_mean:.6f}"
+                        f"persistence={persistence_mean:.6f} skill={skill_loss:.6f}"
                     )
 
                 checkpoint = {

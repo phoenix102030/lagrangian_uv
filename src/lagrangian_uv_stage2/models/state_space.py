@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .backbone import DualBranchAdvectionNet, JointAdvectionNet
 from .covariance import PositiveDiagonal, SeparableCrossCovariance
@@ -106,6 +107,11 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         self.one_step_forecast_weight = float(config["training"].get("one_step_forecast_weight", 0.0))
         self.rollout_forecast_weight = float(config["training"].get("rollout_forecast_weight", 0.0))
         self.kernel_one_step_weight = float(config["training"].get("kernel_one_step_weight", 0.0))
+        self.persistence_skill_weight = float(config["training"].get("persistence_skill_weight", 0.0))
+        self.persistence_skill_margin = float(config["training"].get("persistence_skill_margin", 0.0))
+        self.persistence_skill_horizon_decay = float(
+            config["training"].get("persistence_skill_horizon_decay", 1.0)
+        )
         self.shared_component_advection = bool(model_cfg.get("shared_component_advection", True))
         self.joint_component_advection = bool(model_cfg.get("joint_component_advection", False))
         self.row_normalize_dynamics = bool(model_cfg.get("row_normalize_dynamics", False))
@@ -260,11 +266,16 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         nll = outputs["negative_log_likelihood"]
         normalized_nll = nll / float(self.state_dim) if self.normalize_nll_by_state_dim else nll
 
+        one_step_skill_loss = zero
         if observations.shape[0] > 1:
             one_step_error = outputs["predicted_mean"][1:] - observations[1:]
+            one_step_persistence_error = observations[:-1] - observations[1:]
             one_step_loss = torch.nn.functional.smooth_l1_loss(outputs["predicted_mean"][1:], observations[1:])
             one_step_mae = one_step_error.abs().mean()
             one_step_rmse = torch.sqrt(torch.mean(one_step_error.square()).clamp_min(0.0))
+            one_step_skill_loss = F.relu(
+                one_step_error.abs() - one_step_persistence_error.abs() + self.persistence_skill_margin
+            ).mean()
         else:
             one_step_loss = zero
             one_step_mae = zero
@@ -287,6 +298,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         rollout_loss = zero
         rollout_mae = zero
         rollout_rmse = zero
+        rollout_skill_loss = zero
         rollout_horizon = min(self.forecast_loss_horizon, max(observations.shape[0] - self.forecast_loss_min_context, 0))
         if self.rollout_forecast_weight > 0.0 and rollout_horizon > 0:
             context_end = observations.shape[0] - rollout_horizon
@@ -301,15 +313,34 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 )
                 rollout_target = observations[context_end:]
                 rollout_error = rollout["forecast_mean"] - rollout_target
+                rollout_persistence = observations[context_end - 1].unsqueeze(0).expand_as(rollout_target)
+                rollout_persistence_error = rollout_persistence - rollout_target
                 rollout_loss = torch.nn.functional.smooth_l1_loss(rollout["forecast_mean"], rollout_target)
                 rollout_mae = rollout_error.abs().mean()
                 rollout_rmse = torch.sqrt(torch.mean(rollout_error.square()).clamp_min(0.0))
+                rollout_skill_gap = F.relu(
+                    rollout_error.abs() - rollout_persistence_error.abs() + self.persistence_skill_margin
+                )
+                if self.persistence_skill_horizon_decay < 1.0:
+                    horizon_weights = self.persistence_skill_horizon_decay ** torch.arange(
+                        rollout_skill_gap.shape[0],
+                        device=device,
+                        dtype=rollout_skill_gap.dtype,
+                    )
+                    rollout_skill_loss = (
+                        rollout_skill_gap * horizon_weights.view(-1, 1)
+                    ).sum() / (horizon_weights.sum().clamp_min(1.0e-8) * float(self.state_dim))
+                else:
+                    rollout_skill_loss = rollout_skill_gap.mean()
+
+        persistence_skill_loss = one_step_skill_loss + rollout_skill_loss
 
         total_loss = (
             self.nll_weight * normalized_nll
             + self.one_step_forecast_weight * one_step_loss
             + self.rollout_forecast_weight * rollout_loss
             + self.kernel_one_step_weight * kernel_one_step_loss
+            + self.persistence_skill_weight * persistence_skill_loss
         )
         return total_loss, {
             "negative_log_likelihood": nll,
@@ -317,12 +348,15 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             "one_step_forecast_loss": one_step_loss,
             "one_step_mae": one_step_mae,
             "one_step_rmse": one_step_rmse,
+            "one_step_skill_loss": one_step_skill_loss,
             "rollout_forecast_loss": rollout_loss,
             "rollout_mae": rollout_mae,
             "rollout_rmse": rollout_rmse,
+            "rollout_skill_loss": rollout_skill_loss,
             "kernel_one_step_loss": kernel_one_step_loss,
             "kernel_one_step_mae": kernel_one_step_mae,
             "kernel_one_step_rmse": kernel_one_step_rmse,
+            "persistence_skill_loss": persistence_skill_loss,
         }
 
     def _forward_single(
@@ -378,12 +412,15 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             one_step_losses = []
             one_step_maes = []
             one_step_rmses = []
+            one_step_skill_losses = []
             rollout_losses = []
             rollout_maes = []
             rollout_rmses = []
+            rollout_skill_losses = []
             kernel_one_step_losses = []
             kernel_one_step_maes = []
             kernel_one_step_rmses = []
+            persistence_skill_losses = []
             forcing_abs_means = []
             kernel_mixes = []
             persistence_means = []
@@ -399,12 +436,15 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 one_step_losses.append(outputs["one_step_forecast_loss"])
                 one_step_maes.append(outputs["one_step_mae"])
                 one_step_rmses.append(outputs["one_step_rmse"])
+                one_step_skill_losses.append(outputs["one_step_skill_loss"])
                 rollout_losses.append(outputs["rollout_forecast_loss"])
                 rollout_maes.append(outputs["rollout_mae"])
                 rollout_rmses.append(outputs["rollout_rmse"])
+                rollout_skill_losses.append(outputs["rollout_skill_loss"])
                 kernel_one_step_losses.append(outputs["kernel_one_step_loss"])
                 kernel_one_step_maes.append(outputs["kernel_one_step_mae"])
                 kernel_one_step_rmses.append(outputs["kernel_one_step_rmse"])
+                persistence_skill_losses.append(outputs["persistence_skill_loss"])
                 forcing_abs_means.append(outputs["forcing"].abs().mean())
                 kernel_mixes.append(outputs["kernel_mix"].mean())
                 persistence_means.append(outputs["persistence_diagonal"].mean())
@@ -416,12 +456,15 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 "one_step_forecast_loss": torch.stack(one_step_losses, dim=0).mean(),
                 "one_step_mae": torch.stack(one_step_maes, dim=0).mean(),
                 "one_step_rmse": torch.stack(one_step_rmses, dim=0).mean(),
+                "one_step_skill_loss": torch.stack(one_step_skill_losses, dim=0).mean(),
                 "rollout_forecast_loss": torch.stack(rollout_losses, dim=0).mean(),
                 "rollout_mae": torch.stack(rollout_maes, dim=0).mean(),
                 "rollout_rmse": torch.stack(rollout_rmses, dim=0).mean(),
+                "rollout_skill_loss": torch.stack(rollout_skill_losses, dim=0).mean(),
                 "kernel_one_step_loss": torch.stack(kernel_one_step_losses, dim=0).mean(),
                 "kernel_one_step_mae": torch.stack(kernel_one_step_maes, dim=0).mean(),
                 "kernel_one_step_rmse": torch.stack(kernel_one_step_rmses, dim=0).mean(),
+                "persistence_skill_loss": torch.stack(persistence_skill_losses, dim=0).mean(),
                 "forcing_abs_mean": torch.stack(forcing_abs_means, dim=0).mean(),
                 "kernel_mix": torch.stack(kernel_mixes, dim=0).mean(),
                 "persistence_mean": torch.stack(persistence_means, dim=0).mean(),

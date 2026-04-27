@@ -1,6 +1,6 @@
 project:
   seed: 9527
-  output_dir: ../outputs/stage2_uv_joint_forcing
+  output_dir: ../outputs/stage2_uv_joint_skill
 
 data:
   site_names: [ E05, E06, ASOW6 ]
@@ -63,13 +63,13 @@ model:
   cross_component_scale_init: 0.10
   mean_scale: 2.0
   sigma_floor: 1e-3
-  forcing_scale: 0.05
-  persistence_init: 0.995
-  persistence_min: 0.90
+  forcing_scale: 0.08
+  persistence_init: 0.998
+  persistence_min: 0.95
   persistence_max: 1.0
-  kernel_mix_init: 0.10
+  kernel_mix_init: 0.05
   kernel_mix_min: 0.0
-  kernel_mix_max: 1.0
+  kernel_mix_max: 0.20
 
   encoder:
     hidden_dim: 64
@@ -109,6 +109,9 @@ training:
   one_step_forecast_weight: 1.0
   rollout_forecast_weight: 2.0
   kernel_one_step_weight: 1.0
+  persistence_skill_weight: 0.5
+  persistence_skill_margin: 0.0
+  persistence_skill_horizon_decay: 0.85
   forecast_loss_horizon: 12
   forecast_loss_min_context: 72
   scheduled_sampling_start: 0.0
