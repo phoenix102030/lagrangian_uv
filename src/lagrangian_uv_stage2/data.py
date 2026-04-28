@@ -37,9 +37,13 @@ class Standardizer:
         return cls(mean=np.zeros(shape, dtype=np.float32), std=np.ones(shape, dtype=np.float32))
 
     def transform(self, array: np.ndarray) -> np.ndarray:
-        array = _sanitize_array(array)
-        transformed = (array - self.mean) / self.std
-        return _sanitize_array(transformed)
+        array = np.asarray(array, dtype=np.float32)
+        transformed = np.empty_like(array, dtype=np.float32)
+        np.subtract(array, self.mean, out=transformed)
+        np.divide(transformed, self.std, out=transformed)
+        np.nan_to_num(transformed, copy=False, nan=0.0, posinf=1.0e6, neginf=-1.0e6)
+        np.clip(transformed, -1.0e6, 1.0e6, out=transformed)
+        return transformed
 
     def inverse_transform(self, value: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
         if isinstance(value, torch.Tensor):
@@ -132,7 +136,10 @@ class LazyNwpSequenceSource:
         block = np.transpose(block, self.permutation)
         block = block[:, :, :, self.channel_indices]
         block = np.transpose(block, (2, 3, 0, 1))
-        return _sanitize_array(block)
+        block = np.ascontiguousarray(block, dtype=np.float32)
+        np.nan_to_num(block, copy=False, nan=0.0, posinf=1.0e6, neginf=-1.0e6)
+        np.clip(block, -1.0e6, 1.0e6, out=block)
+        return block
 
     def _cached_chunk(self, chunk_index: int) -> np.ndarray:
         cached = self._chunk_cache.get(chunk_index)
@@ -382,6 +389,8 @@ def _select_nwp_source(config: dict[str, Any], subset: str, channel_indices: lis
                 grid_size=tuple(nwp_cfg["grid_size"]),
                 total_channels=int(nwp_cfg["total_channels"]),
                 channel_indices=list(channel_indices),
+                cache_chunk_size=int(nwp_cfg.get("lazy_cache_chunk_size", config["data"]["windows"]["window_size"])),
+                max_cache_chunks=int(nwp_cfg.get("lazy_max_cache_chunks", 1)),
             )
         except Exception:
             pass
@@ -485,8 +494,19 @@ def build_data_bundle(
             obs_scaler = Standardizer.identity((1, obs_offline.shape[-1]))
 
         if norm_cfg["normalize_nwp"]:
-            nwp_u_scaler = _fit_nwp_standardizer(nwp_u_offline_source, train_length=split_index, eps=eps)
-            nwp_v_scaler = _fit_nwp_standardizer(nwp_v_offline_source, train_length=split_index, eps=eps)
+            standardizer_chunk_size = int(nwp_cfg.get("standardizer_chunk_size", 128))
+            nwp_u_scaler = _fit_nwp_standardizer(
+                nwp_u_offline_source,
+                train_length=split_index,
+                eps=eps,
+                chunk_size=standardizer_chunk_size,
+            )
+            nwp_v_scaler = _fit_nwp_standardizer(
+                nwp_v_offline_source,
+                train_length=split_index,
+                eps=eps,
+                chunk_size=standardizer_chunk_size,
+            )
         else:
             nwp_u_scaler = Standardizer.identity((1, nwp_u_offline_source.num_channels, 1, 1))
             nwp_v_scaler = Standardizer.identity((1, nwp_v_offline_source.num_channels, 1, 1))

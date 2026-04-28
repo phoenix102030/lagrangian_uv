@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import random
+import shutil
+import gc
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -523,7 +525,12 @@ def train(config: dict[str, Any]) -> Path:
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    torch.save(checkpoint, best_path)
+                    shutil.copyfile(last_path, best_path)
+                del checkpoint
+                gc.collect()
+
+            if context.enabled:
+                dist.barrier()
 
             if device.type == "cuda" and bool(config["training"].get("empty_cache_each_epoch", True)):
                 torch.cuda.empty_cache()

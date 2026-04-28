@@ -21,6 +21,9 @@ data:
     v_channel_indices: [ 7, 9, 11 ]
     grid_size: [ 40, 40 ]
     total_channels: 12
+    lazy_cache_chunk_size: 288
+    lazy_max_cache_chunks: 1
+    standardizer_chunk_size: 128
 
   coordinates:
     manual: null
