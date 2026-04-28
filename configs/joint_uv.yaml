@@ -92,7 +92,7 @@ covariance:
 
 training:
   device: cuda
-  batch_size: 2
+  batch_size: 8
   gradient_accumulation_steps: 2
   epochs: 100
   learning_rate: 1e-4
@@ -112,7 +112,7 @@ training:
   scheduled_sampling_decay_epochs: 40
   max_bad_batches_per_epoch: 100
   log_every: 1
-  num_workers: 1
+  num_workers: 0
   prefetch_factor: 1
   pin_memory: false
   persistent_workers: false

@@ -89,31 +89,6 @@ class StochasticAdvectionKernel(nn.Module):
     def _block_scales(self) -> torch.Tensor:
         return F.softplus(self.block_scale_raw) + self.min_block_scale
 
-    def _block_drift_dispersion(
-        self,
-        mean_i: torch.Tensor,
-        mean_j: torch.Tensor,
-        cov_i: torch.Tensor,
-        cov_j: torch.Tensor,
-        same_component: bool,
-        eye2: torch.Tensor,
-        cross_cov_ij: torch.Tensor | None,
-        cross_cov_ji: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if same_component:
-            drift = self.delta_t * mean_j
-            dispersion = eye2 + 2.0 * (self.delta_t**2) * cov_j
-        else:
-            drift = self.delta_t * (mean_i - mean_j)
-            relative_covariance = cov_i + cov_j
-            if cross_cov_ij is not None and cross_cov_ji is not None:
-                relative_covariance = relative_covariance - cross_cov_ij - cross_cov_ji
-            dispersion = eye2 + 2.0 * (self.delta_t**2) * relative_covariance
-
-        drift = _sanitize_vector(drift)
-        dispersion = _sanitize_matrix(dispersion + self.kernel_jitter * eye2)
-        return drift, dispersion
-
     def forward(
         self,
         means: torch.Tensor,
@@ -146,88 +121,73 @@ class StochasticAdvectionKernel(nn.Module):
         eye2 = torch.eye(2, device=means.device, dtype=kernel_dtype)
         state_dim = self.num_sites * self.num_components
 
-        transitions = []
+        component_rows = []
         drift_terms = []
         dispersion_terms = []
+        target_coords = site_coords.view(1, self.num_sites, 1, 2)
+        source_coords = site_coords.view(1, 1, self.num_sites, 2)
 
-        target_coords = site_coords.unsqueeze(1)
-        source_coords = site_coords.unsqueeze(0)
+        for target_component in range(self.num_components):
+            source_blocks = []
+            target_drift_blocks = []
+            target_dispersion_blocks = []
 
-        for t in range(num_steps):
-            component_rows = []
-            drift_blocks = []
-            dispersion_blocks = []
+            for source_component in range(self.num_components):
+                mean_i = means[:, :, target_component, :]
+                mean_j = means[:, :, source_component, :]
+                cov_i = covariances[:, :, target_component, :, :]
+                cov_j = covariances[:, :, source_component, :, :]
 
-            for target_component in range(self.num_components):
-                source_blocks = []
-                target_drift_blocks = []
-                target_dispersion_blocks = []
-
-                for source_component in range(self.num_components):
-                    mean_i = means[t, :, target_component, :]
-                    mean_j = means[t, :, source_component, :]
-                    cov_i = covariances[t, :, target_component, :, :]
-                    cov_j = covariances[t, :, source_component, :, :]
-
-                    cross_cov_ij = None
-                    cross_cov_ji = None
-                    if joint_covariance is not None and target_component != source_component:
+                if target_component == source_component:
+                    drift = self.delta_t * mean_j
+                    dispersion = eye2 + 2.0 * (self.delta_t**2) * cov_j
+                else:
+                    drift = self.delta_t * (mean_i - mean_j)
+                    relative_covariance = cov_i + cov_j
+                    if joint_covariance is not None:
                         i_start = target_component * 2
                         j_start = source_component * 2
-                        cross_cov_ij = joint_covariance[t, :, i_start : i_start + 2, j_start : j_start + 2]
-                        cross_cov_ji = joint_covariance[t, :, j_start : j_start + 2, i_start : i_start + 2]
+                        cross_cov_ij = joint_covariance[:, :, i_start : i_start + 2, j_start : j_start + 2]
+                        cross_cov_ji = joint_covariance[:, :, j_start : j_start + 2, i_start : i_start + 2]
+                        relative_covariance = relative_covariance - cross_cov_ij - cross_cov_ji
+                    dispersion = eye2 + 2.0 * (self.delta_t**2) * relative_covariance
 
-                    drift, dispersion = self._block_drift_dispersion(
-                        mean_i=mean_i,
-                        mean_j=mean_j,
-                        cov_i=cov_i,
-                        cov_j=cov_j,
-                        same_component=(target_component == source_component),
-                        eye2=eye2,
-                        cross_cov_ij=cross_cov_ij,
-                        cross_cov_ji=cross_cov_ji,
-                    )
+                drift = _sanitize_vector(drift)
+                dispersion = _sanitize_matrix(dispersion + self.kernel_jitter * eye2)
+                centered = target_coords - source_coords - drift.unsqueeze(1)
+                dispersion_by_target = dispersion.unsqueeze(1).expand(-1, self.num_sites, -1, -1, -1)
+                inv_dispersion = _analytical_2x2_inverse(dispersion_by_target, self.kernel_jitter)
+                quad_form = torch.matmul(
+                    centered.unsqueeze(-2),
+                    torch.matmul(inv_dispersion, centered.unsqueeze(-1)),
+                ).squeeze(-1).squeeze(-1)
+                quad_form = torch.nan_to_num(quad_form, nan=0.0, posinf=60.0, neginf=0.0)
+                quad_form = torch.clamp(quad_form, min=0.0, max=60.0)
 
-                    centered = target_coords - source_coords - drift.unsqueeze(0)
-                    dispersion_by_target = dispersion.unsqueeze(0).expand(self.num_sites, -1, -1, -1)
-                    inv_dispersion = _analytical_2x2_inverse(dispersion_by_target, self.kernel_jitter)
-                    quad_form = torch.matmul(
-                        centered.unsqueeze(-2),
-                        torch.matmul(inv_dispersion, centered.unsqueeze(-1)),
-                    ).squeeze(-1).squeeze(-1)
-                    quad_form = torch.nan_to_num(quad_form, nan=0.0, posinf=60.0, neginf=0.0)
-                    quad_form = torch.clamp(quad_form, min=0.0, max=60.0)
+                block = torch.exp(torch.clamp(-0.5 * quad_form, min=-60.0, max=20.0))
+                block = component_mask[target_component, source_component] * block_scales[
+                    target_component, source_component
+                ] * block
+                block = self.kernel_decay * torch.clamp(block, min=0.0, max=self.max_transition_value)
+                block = torch.nan_to_num(block, nan=0.0, posinf=self.max_transition_value, neginf=0.0)
 
-                    block = torch.exp(torch.clamp(-0.5 * quad_form, min=-60.0, max=20.0))
-                    block = component_mask[target_component, source_component] * block_scales[
-                        target_component, source_component
-                    ] * block
-                    block = self.kernel_decay * torch.clamp(block, min=0.0, max=self.max_transition_value)
-                    block = torch.nan_to_num(block, nan=0.0, posinf=self.max_transition_value, neginf=0.0)
+                source_blocks.append(block)
+                target_drift_blocks.append(drift)
+                target_dispersion_blocks.append(dispersion)
 
-                    source_blocks.append(block)
-                    target_drift_blocks.append(drift)
-                    target_dispersion_blocks.append(dispersion)
+            component_rows.append(torch.cat(source_blocks, dim=2))
+            drift_terms.append(torch.stack(target_drift_blocks, dim=1))
+            dispersion_terms.append(torch.stack(target_dispersion_blocks, dim=1))
 
-                component_rows.append(torch.cat(source_blocks, dim=1))
-                drift_blocks.append(torch.stack(target_drift_blocks, dim=0))
-                dispersion_blocks.append(torch.stack(target_dispersion_blocks, dim=0))
-
-            transition = torch.cat(component_rows, dim=0)
-            identity = torch.eye(state_dim, device=transition.device, dtype=transition.dtype)
-            transition = (1.0 - identity_mix) * transition + identity_mix * identity
-            transition = _sanitize_matrix(transition) if transition.shape[-1] == 2 else _sanitize_vector(transition)
-            transition = transition.view(state_dim, state_dim)
-            transitions.append(transition)
-            drift_terms.append(torch.stack(drift_blocks, dim=0))
-            dispersion_terms.append(torch.stack(dispersion_blocks, dim=0))
-
-        transition_stack = torch.stack(transitions, dim=0)
+        transition_stack = torch.cat(component_rows, dim=1)
+        identity = torch.eye(state_dim, device=transition_stack.device, dtype=transition_stack.dtype)
+        transition_stack = (1.0 - identity_mix) * transition_stack + identity_mix * identity.unsqueeze(0)
+        transition_stack = _sanitize_vector(transition_stack).view(num_steps, state_dim, state_dim)
         return (
             transition_stack,
             {
-                "drift_terms": torch.stack(drift_terms, dim=0),
-                "dispersion_terms": torch.stack(dispersion_terms, dim=0),
+                "drift_terms": torch.stack(drift_terms, dim=1),
+                "dispersion_terms": torch.stack(dispersion_terms, dim=1),
                 "block_scales": block_scales,
                 "component_mask": component_mask,
                 "identity_mix": identity_mix,
