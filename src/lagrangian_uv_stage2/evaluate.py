@@ -240,14 +240,12 @@ def _one_step_operator_diagnostics(
     observations_scaled: np.ndarray,
     transition: np.ndarray,
     kernel_transition: np.ndarray,
-    persistence_matrix: np.ndarray,
     forcing: np.ndarray,
     bundle: DataBundle,
 ) -> dict[str, Any]:
     observations_scaled = np.asarray(observations_scaled, dtype=np.float32)
     transition = np.asarray(transition, dtype=np.float32)
     kernel_transition = np.asarray(kernel_transition, dtype=np.float32)
-    persistence_matrix = np.asarray(persistence_matrix, dtype=np.float32)
     forcing = np.asarray(forcing, dtype=np.float32)
 
     if observations_scaled.shape[0] < 2:
@@ -261,10 +259,9 @@ def _one_step_operator_diagnostics(
 
     predictions = {
         "raw_persistence": prev,
-        "learned_persistence_matrix": np.einsum("ij,tj->ti", persistence_matrix, prev),
-        "kernel_transition": np.einsum("tij,tj->ti", kernel_t, prev),
-        "dynamics_transition_without_forcing": np.einsum("tij,tj->ti", transition_t, prev),
-        "dynamics_transition_with_forcing": np.einsum("tij,tj->ti", transition_t, prev) + forcing_t,
+        "ide_kernel": np.einsum("tij,tj->ti", kernel_t, prev),
+        "ide_dynamics_without_forcing": np.einsum("tij,tj->ti", transition_t, prev),
+        "ide_dynamics_with_forcing": np.einsum("tij,tj->ti", transition_t, prev) + forcing_t,
     }
     baseline = _metric_with_scaled_and_denorm(predictions["raw_persistence"], target, bundle)
     baseline_mae = baseline["denormalized"]["mae"]
@@ -283,7 +280,7 @@ def _one_step_operator_diagnostics(
         diagnostics["metrics"][name] = metrics
 
     target_delta = target - prev
-    dynamics_delta = predictions["dynamics_transition_with_forcing"] - prev
+    dynamics_delta = predictions["ide_dynamics_with_forcing"] - prev
     diagnostics["delta_stats_scaled"] = {
         "target_delta_abs": _stat_summary(target_delta, absolute=True),
         "dynamics_delta_abs": _stat_summary(dynamics_delta, absolute=True),
@@ -352,12 +349,17 @@ def _advection_diagnostics(
         "components": {},
     }
     for component_idx, component_name in enumerate(component_names):
-        cov = covariances[:, component_idx]
+        if means.ndim == 4:
+            component_means = means[:, :, component_idx]
+            cov = covariances[:, :, component_idx]
+        else:
+            component_means = means[:, component_idx]
+            cov = covariances[:, component_idx]
         eigvals = np.linalg.eigvalsh(cov)
         diagnostics["components"][component_name] = {
-            "mu_x": _stat_summary(means[:, component_idx, 0]),
-            "mu_y": _stat_summary(means[:, component_idx, 1]),
-            "mu_norm": _stat_summary(np.linalg.norm(means[:, component_idx], axis=-1)),
+            "mu_x": _stat_summary(component_means[..., 0]),
+            "mu_y": _stat_summary(component_means[..., 1]),
+            "mu_norm": _stat_summary(np.linalg.norm(component_means, axis=-1)),
             "cov_trace": _stat_summary(np.trace(cov, axis1=-2, axis2=-1)),
             "cov_min_eigenvalue": _stat_summary(eigvals[..., 0]),
             "cov_max_eigenvalue": _stat_summary(eigvals[..., -1]),
@@ -387,7 +389,7 @@ def _advection_diagnostics(
             "condition_number": _stat_summary(eigvals[..., -1] / np.clip(eigvals[..., 0], 1.0e-12, None)),
         }
         if joint_covariance.shape[-2:] == (4, 4):
-            cross_block = joint_covariance[:, 0:2, 2:4]
+            cross_block = joint_covariance[..., 0:2, 2:4]
             diagnostics["joint_covariance"]["u_v_cross_block_abs"] = _stat_summary(cross_block, absolute=True)
             diagnostics["joint_covariance"]["u_v_cross_block_frobenius_norm"] = _stat_summary(
                 np.linalg.norm(cross_block, axis=(-2, -1))
@@ -453,8 +455,8 @@ def _build_findings(
     if one_step_diagnostics.get("available"):
         metrics = one_step_diagnostics["metrics"]
         persistence_mae = metrics["raw_persistence"]["denormalized"]["mae"]
-        dynamics_mae = metrics["dynamics_transition_with_forcing"]["denormalized"]["mae"]
-        kernel_mae = metrics["kernel_transition"]["denormalized"]["mae"]
+        dynamics_mae = metrics["ide_dynamics_with_forcing"]["denormalized"]["mae"]
+        kernel_mae = metrics["ide_kernel"]["denormalized"]["mae"]
         if dynamics_mae > persistence_mae:
             findings.append(
                 {
@@ -470,7 +472,7 @@ def _build_findings(
                 {
                     "severity": "warning",
                     "code": "kernel_one_step_underperforms_persistence",
-                    "message": "The row-normalized kernel transition alone is worse than raw persistence on this window.",
+                    "message": "The open-system IDE kernel transition alone is worse than raw persistence on this window.",
                     "kernel_mae": float(kernel_mae),
                     "persistence_mae": float(persistence_mae),
                 }
@@ -775,19 +777,32 @@ def _export_advection_csv(
     mean_path = export_dir / "advection_means.csv"
     with mean_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["time_index", "component", "mu_x", "mu_y"])
+        writer.writerow(["time_index", "site_index", "component", "mu_x", "mu_y"])
         for t in range(means.shape[0]):
-            for component_idx, component_name in enumerate(component_names):
-                writer.writerow([t, component_name, means[t, component_idx, 0], means[t, component_idx, 1]])
+            if means.ndim == 4:
+                for site_idx in range(means.shape[1]):
+                    for component_idx, component_name in enumerate(component_names):
+                        writer.writerow(
+                            [t, site_idx, component_name, means[t, site_idx, component_idx, 0], means[t, site_idx, component_idx, 1]]
+                        )
+            else:
+                for component_idx, component_name in enumerate(component_names):
+                    writer.writerow([t, "", component_name, means[t, component_idx, 0], means[t, component_idx, 1]])
 
     covariance_path = export_dir / "advection_covariances.csv"
     with covariance_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["time_index", "component", "sigma_xx", "sigma_xy", "sigma_yx", "sigma_yy"])
+        writer.writerow(["time_index", "site_index", "component", "sigma_xx", "sigma_xy", "sigma_yx", "sigma_yy"])
         for t in range(covariances.shape[0]):
-            for component_idx, component_name in enumerate(component_names):
-                cov = covariances[t, component_idx]
-                writer.writerow([t, component_name, cov[0, 0], cov[0, 1], cov[1, 0], cov[1, 1]])
+            if covariances.ndim == 6:
+                for site_idx in range(covariances.shape[1]):
+                    for component_idx, component_name in enumerate(component_names):
+                        cov = covariances[t, site_idx, component_idx]
+                        writer.writerow([t, site_idx, component_name, cov[0, 0], cov[0, 1], cov[1, 0], cov[1, 1]])
+            else:
+                for component_idx, component_name in enumerate(component_names):
+                    cov = covariances[t, component_idx]
+                    writer.writerow([t, "", component_name, cov[0, 0], cov[0, 1], cov[1, 0], cov[1, 1]])
 
 
 def _export_joint_advection_covariance_csv(
@@ -803,11 +818,19 @@ def _export_joint_advection_covariance_csv(
     path = export_dir / "joint_advection_covariances.csv"
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["time_index", "row_index", "row_label", "col_index", "col_label", "value"])
+        writer.writerow(["time_index", "site_index", "row_index", "row_label", "col_index", "col_label", "value"])
         for t in range(joint_covariance.shape[0]):
-            for row_idx, row_label in enumerate(labels):
-                for col_idx, col_label in enumerate(labels):
-                    writer.writerow([t, row_idx, row_label, col_idx, col_label, joint_covariance[t, row_idx, col_idx]])
+            if joint_covariance.ndim == 4:
+                for site_idx in range(joint_covariance.shape[1]):
+                    for row_idx, row_label in enumerate(labels):
+                        for col_idx, col_label in enumerate(labels):
+                            writer.writerow(
+                                [t, site_idx, row_idx, row_label, col_idx, col_label, joint_covariance[t, site_idx, row_idx, col_idx]]
+                            )
+            else:
+                for row_idx, row_label in enumerate(labels):
+                    for col_idx, col_label in enumerate(labels):
+                        writer.writerow([t, "", row_idx, row_label, col_idx, col_label, joint_covariance[t, row_idx, col_idx]])
 
 
 def _export_transition_csv(export_dir: Path, transition: np.ndarray, labels: list[str]) -> None:
@@ -836,12 +859,22 @@ def _maybe_plot_diagnostics(
 
     outputs: list[str] = []
     time_index = np.arange(arrays["advection_means"].shape[0])
+    advection_means = arrays["advection_means"]
+    advection_covariances = arrays["advection_covariances"]
+    if advection_means.ndim == 4:
+        mean_for_plot = advection_means.mean(axis=1)
+    else:
+        mean_for_plot = advection_means
+    if advection_covariances.ndim == 6:
+        covariance_for_plot = advection_covariances.mean(axis=1)
+    else:
+        covariance_for_plot = advection_covariances
 
     mean_path = export_dir / "advection_mean_timeseries.png"
     fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
     for component_idx, component_name in enumerate(component_names):
-        axes[component_idx].plot(time_index, arrays["advection_means"][:, component_idx, 0], label=f"{component_name}_x")
-        axes[component_idx].plot(time_index, arrays["advection_means"][:, component_idx, 1], label=f"{component_name}_y")
+        axes[component_idx].plot(time_index, mean_for_plot[:, component_idx, 0], label=f"{component_name}_x")
+        axes[component_idx].plot(time_index, mean_for_plot[:, component_idx, 1], label=f"{component_name}_y")
         axes[component_idx].set_ylabel("Mean")
         axes[component_idx].set_title(f"Advection mean for {component_name}")
         axes[component_idx].legend(loc="upper right")
@@ -854,7 +887,7 @@ def _maybe_plot_diagnostics(
     covariance_path = export_dir / "advection_covariance_timeseries.png"
     fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
     for component_idx, component_name in enumerate(component_names):
-        cov = arrays["advection_covariances"][:, component_idx]
+        cov = covariance_for_plot[:, component_idx]
         axes[component_idx].plot(time_index, cov[:, 0, 0], label="sigma_xx")
         axes[component_idx].plot(time_index, cov[:, 0, 1], label="sigma_xy")
         axes[component_idx].plot(time_index, cov[:, 1, 1], label="sigma_yy")
@@ -896,21 +929,6 @@ def _maybe_plot_diagnostics(
         ("measurement_covariance_matrix.png", arrays["measurement_covariance_matrix"], feature_names, feature_names, "Measurement covariance R"),
         ("kernel_block_scales.png", arrays["block_scales"], component_names, component_names, "Kernel block scales"),
     ]
-
-    if "persistence_matrix" in arrays:
-        matrix_specs.append(
-            ("persistence_matrix.png", arrays["persistence_matrix"], feature_names, feature_names, "Persistence matrix")
-        )
-    if "residual_transition" in arrays:
-        matrix_specs.append(
-            (
-                "mean_residual_transition_matrix.png",
-                arrays["residual_transition"].mean(axis=0),
-                feature_names,
-                feature_names,
-                "Mean residual transition matrix",
-            )
-        )
 
     for filename, matrix, x_labels, y_labels, title in matrix_specs:
         path = export_dir / filename
@@ -1110,12 +1128,8 @@ def export_window_diagnostics(
     q_matrix = _to_numpy(outputs["process_covariance_matrix"])
     r_matrix = _to_numpy(outputs["measurement_covariance_matrix"])
     block_scales = _to_numpy(outputs["block_scales"])
-    persistence_diagonal = _to_numpy(outputs["persistence_diagonal"])
-    persistence_matrix = _to_numpy(outputs["persistence_matrix"])
-    kernel_mix = float(_to_numpy(outputs.get("kernel_mix", outputs["residual_gate"])).reshape(-1)[0])
-    residual_gate = float(_to_numpy(outputs["residual_gate"]).reshape(-1)[0])
-    residual_transition = _to_numpy(outputs["residual_transition"])
     identity_mix = float(_to_numpy(outputs["identity_mix"]).reshape(-1)[0])
+    kernel_decay = float(_to_numpy(outputs.get("kernel_decay", np.asarray([1.0], dtype=np.float32))).reshape(-1)[0])
     initial_mean = _to_numpy(model.initial_mean.detach().cpu())
     initial_covariance = _to_numpy(model.initial_covariance().detach().cpu())
 
@@ -1135,16 +1149,12 @@ def export_window_diagnostics(
         "dispersion_terms": dispersion_terms,
         "kernel_transition": kernel_transition,
         "transition": transition,
-        "persistence_diagonal": persistence_diagonal,
-        "persistence_matrix": persistence_matrix,
-        "kernel_mix": np.asarray([kernel_mix], dtype=np.float32),
-        "residual_gate": np.asarray([residual_gate], dtype=np.float32),
-        "residual_transition": residual_transition,
         "process_covariance_matrix": q_matrix,
         "measurement_covariance_matrix": r_matrix,
         "block_scales": block_scales,
         "component_mask": _to_numpy(outputs["component_mask"]),
         "identity_mix": np.asarray([identity_mix], dtype=np.float32),
+        "kernel_decay": np.asarray([kernel_decay], dtype=np.float32),
         "initial_mean": initial_mean,
         "initial_covariance": initial_covariance,
         "site_coords": bundle.site_coords.astype(np.float32),
@@ -1192,11 +1202,6 @@ def export_window_diagnostics(
             feature_names=bundle.feature_names,
             component_names=config["data"]["component_names"],
         ),
-        "persistence_matrix": _matrix_structural_diagnostics(
-            persistence_matrix,
-            feature_names=bundle.feature_names,
-            component_names=config["data"]["component_names"],
-        ),
         "process_covariance_matrix": _matrix_structural_diagnostics(
             q_matrix,
             feature_names=bundle.feature_names,
@@ -1212,7 +1217,6 @@ def export_window_diagnostics(
         observations_scaled=arrays["observations_scaled"],
         transition=transition,
         kernel_transition=kernel_transition,
-        persistence_matrix=persistence_matrix,
         forcing=forcing,
         bundle=bundle,
     )
@@ -1269,11 +1273,8 @@ def export_window_diagnostics(
             "transition": list(transition.shape),
         },
         "dynamics_parameters": {
-            "persistence_diagonal": persistence_diagonal.tolist(),
-            "kernel_mix": kernel_mix,
-            "residual_gate": residual_gate,
             "identity_mix": identity_mix,
-            "row_normalize_dynamics": bool(float(_to_numpy(outputs.get("row_normalize_dynamics", 0.0)).reshape(-1)[0])),
+            "kernel_decay": kernel_decay,
             "component_mask": _to_numpy(outputs["component_mask"]).tolist(),
         },
         "predicted_metrics": predicted_metrics,

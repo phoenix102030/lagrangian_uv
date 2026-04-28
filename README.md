@@ -57,11 +57,10 @@ D_t^{(ij)} = I_2 + 2 \Delta t^2 (\Sigma_{i,t} + \Sigma_{j,t})
 
 which is the block-diagonal `Sigma_gamma` analogue of the theorem-inspired construction.
 
-The current default experiment also adds three forecasting-oriented changes:
-
-1. A learned persistence backbone, so the state update starts from an explicit autoregressive baseline.
-2. A persistence-versus-kernel mixture, so transport stays on the main path instead of collapsing into a tiny residual.
-3. A direct NWP forcing head and a hybrid training objective that mixes Kalman likelihood with one-step and multi-step forecast losses.
+The current default experiment uses the IDE kernel directly as the dynamics:
+`A_t = K_t`. There is no learned persistence backbone and no residual
+kernel-versus-identity mixing. A direct NWP forcing head remains available, but
+is disabled by default so forecast motion comes from the kernel.
 
 ## Project Layout
 
@@ -69,7 +68,7 @@ The current default experiment also adds three forecasting-oriented changes:
 - `src/lagrangian_uv_stage2/data.py`: `.mat` loading, 140m `u/v` extraction, scaling, datasets
 - `src/lagrangian_uv_stage2/models/backbone.py`: NWP encoders for advection mean/covariance and direct forcing
 - `src/lagrangian_uv_stage2/models/kernel.py`: theorem-inspired stage-2 kernel assembly
-- `src/lagrangian_uv_stage2/models/state_space.py`: persistence-plus-residual state-space model and hybrid objective
+- `src/lagrangian_uv_stage2/models/state_space.py`: pure IDE-kernel state-space model and hybrid objective
 - `src/lagrangian_uv_stage2/train.py`: offline training loop
 - `src/lagrangian_uv_stage2/evaluate.py`: rolling forecast helpers on online data
 - `scripts/train.py`: CLI entrypoint for training
@@ -139,7 +138,7 @@ This writes:
 - `learned_parameters.npz`: every learned parameter from the model state dict
 - `parameter_summary.json`: names and shapes of all learned parameters
 - `transition_matrices.npy`: the full time-varying `6 x 6` dynamics matrix sequence
-- `kernel_transition_matrices.npy`: the raw kernel-induced transition sequence before persistence/kernel mixing
+- `kernel_transition_matrices.npy`: the raw open-system IDE kernel transition sequence
 - `forcing.npy`: the learned NWP forcing sequence
 - `advection_means.csv` and `advection_covariances.csv`: tabular exports of `\mu_t` and `\Sigma_t`
 - `transition_matrix_long.csv`: all transition entries in long format
@@ -176,8 +175,8 @@ Everything likely to change is exposed in `configs/default.yaml`, including:
 - hybrid objective weights and forecast-loss horizon
 - NWP encoder width and dropout
 - advection mean scale
-- persistence diagonal range, kernel-mix range, and forcing scale
-- kernel jitter and identity mixing
+- kernel decay, block scales, cross-component coupling, and forcing scale
+- kernel jitter and optional fixed identity mixing
 - Kalman linear algebra dtype and adaptive Cholesky jitter
 - robust matrix sanitization and diagonal fallback for early training
 - conservative optimizer defaults plus non-finite batch skipping

@@ -1,6 +1,6 @@
 project:
   seed: 9527
-  output_dir: ../outputs/stage2_uv_02
+  output_dir: ../outputs/stage2_uv_ide
 
 data:
   site_names: [ E05, E06, ASOW6 ]
@@ -52,24 +52,17 @@ model:
   kernel_jitter: 1e-4
   transition_jitter: 1e-4
   cholesky_jitter: 1e-4
-  max_cholesky_tries: 12
+  kernel_decay: 0.99
   identity_mix: 0.0
   min_block_scale: 1e-4
-  allow_cross_component: false
-  joint_component_advection: false
-  shared_component_advection: true
-  row_normalize_dynamics: true
-  diagonal_block_scale_init: 1.0
-  cross_component_scale_init: 0.02
+  max_transition_value: 10.0
+  allow_cross_component: true
+  joint_component_advection: true
+  diagonal_block_scale_init: 0.30
+  cross_component_scale_init: 0.03
   mean_scale: 2.0
   sigma_floor: 1e-3
   forcing_scale: 0.0
-  persistence_init: 0.2
-  persistence_min: 0.0
-  persistence_max: 0.98
-  kernel_mix_init: 0.95
-  kernel_mix_min: 0.70
-  kernel_mix_max: 1.0
 
   encoder:
     hidden_dim: 64
@@ -124,9 +117,7 @@ training:
   amp_dtype: float16
   use_ddp: true
   ddp_backend: nccl
-  # Needed during ablations where only kernel_one_step_loss is active;
-  # otherwise DDP errors on forcing/Kalman/covariance parameters that do not receive gradients.
-  find_unused_parameters: true
+  find_unused_parameters: false
   use_data_parallel: false
   allow_tf32: true
   cudnn_benchmark: true

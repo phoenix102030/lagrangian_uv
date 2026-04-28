@@ -85,8 +85,8 @@ def main() -> None:
     if operator_diag.get("available"):
         metrics = operator_diag["metrics"]
         persistence_mae = metrics["raw_persistence"]["denormalized"]["mae"]
-        dynamics_mae = metrics["dynamics_transition_with_forcing"]["denormalized"]["mae"]
-        kernel_mae = metrics["kernel_transition"]["denormalized"]["mae"]
+        dynamics_mae = metrics["ide_dynamics_with_forcing"]["denormalized"]["mae"]
+        kernel_mae = metrics["ide_kernel"]["denormalized"]["mae"]
         print(
             "  One-step operator MAE: "
             f"persistence={persistence_mae:.6f} "
