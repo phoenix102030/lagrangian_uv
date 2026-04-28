@@ -794,7 +794,7 @@ def _export_advection_csv(
         writer = csv.writer(handle)
         writer.writerow(["time_index", "site_index", "component", "sigma_xx", "sigma_xy", "sigma_yx", "sigma_yy"])
         for t in range(covariances.shape[0]):
-            if covariances.ndim == 6:
+            if covariances.ndim == 5:
                 for site_idx in range(covariances.shape[1]):
                     for component_idx, component_name in enumerate(component_names):
                         cov = covariances[t, site_idx, component_idx]
@@ -865,7 +865,7 @@ def _maybe_plot_diagnostics(
         mean_for_plot = advection_means.mean(axis=1)
     else:
         mean_for_plot = advection_means
-    if advection_covariances.ndim == 6:
+    if advection_covariances.ndim == 5:
         covariance_for_plot = advection_covariances.mean(axis=1)
     else:
         covariance_for_plot = advection_covariances

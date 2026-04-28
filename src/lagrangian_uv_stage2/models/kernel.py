@@ -126,7 +126,7 @@ class StochasticAdvectionKernel(nn.Module):
                 "means must have shape [time, num_sites, num_components, spatial_dim], "
                 f"got {means.shape}."
             )
-        if covariances.ndim != 6:
+        if covariances.ndim != 5:
             raise ValueError(
                 "covariances must have shape [time, num_sites, num_components, spatial_dim, spatial_dim], "
                 f"got {covariances.shape}."
