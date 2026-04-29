@@ -76,6 +76,8 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         self.one_step_forecast_weight = float(config["training"].get("one_step_forecast_weight", 0.0))
         self.rollout_forecast_weight = float(config["training"].get("rollout_forecast_weight", 0.0))
         self.kernel_one_step_weight = float(config["training"].get("kernel_one_step_weight", 0.0))
+        self.transition_row_sum_weight = float(config["training"].get("transition_row_sum_weight", 0.0))
+        self.transition_row_sum_floor = float(config["training"].get("transition_row_sum_floor", 0.0))
         self.forecast_loss_horizon = int(config["training"].get("forecast_loss_horizon", 0))
         self.forecast_loss_min_context = int(config["training"].get("forecast_loss_min_context", 1))
         self.scheduled_sampling_ratio = float(config["training"].get("scheduled_sampling_start", 0.0))
@@ -209,11 +211,17 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 rollout_mae = rollout_error.abs().mean()
                 rollout_rmse = torch.sqrt(torch.mean(rollout_error.square()).clamp_min(0.0))
 
+        transition_row_sum_loss = zero
+        if self.transition_row_sum_weight > 0.0 and self.transition_row_sum_floor > 0.0:
+            row_sum = outputs["transition_row_sum"].to(dtype=output_dtype)
+            transition_row_sum_loss = F.relu(self.transition_row_sum_floor - row_sum).square().mean()
+
         total_loss = (
             self.nll_weight * normalized_nll
             + self.one_step_forecast_weight * one_step_loss
             + self.rollout_forecast_weight * rollout_loss
             + self.kernel_one_step_weight * kernel_one_step_loss
+            + self.transition_row_sum_weight * transition_row_sum_loss
         )
         return total_loss, {
             "negative_log_likelihood": nll,
@@ -227,6 +235,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
             "kernel_one_step_loss": kernel_one_step_loss,
             "kernel_one_step_mae": kernel_one_step_mae,
             "kernel_one_step_rmse": kernel_one_step_rmse,
+            "transition_row_sum_loss": transition_row_sum_loss,
         }
 
     def _forward_single(
@@ -289,6 +298,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 "kernel_one_step_loss",
                 "kernel_one_step_mae",
                 "kernel_one_step_rmse",
+                "transition_row_sum_loss",
                 "forcing_abs_mean",
                 "transition_abs_mean",
                 "transition_row_sum_mean",

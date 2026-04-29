@@ -35,6 +35,7 @@ LOSS_METRIC_KEYS = (
     "kernel_one_step_loss",
     "kernel_one_step_mae",
     "kernel_one_step_rmse",
+    "transition_row_sum_loss",
     "forcing_abs_mean",
     "transition_abs_mean",
     "transition_row_sum_mean",
