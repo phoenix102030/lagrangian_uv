@@ -78,6 +78,7 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
         self.kernel_one_step_weight = float(config["training"].get("kernel_one_step_weight", 0.0))
         self.transition_row_sum_weight = float(config["training"].get("transition_row_sum_weight", 0.0))
         self.transition_row_sum_floor = float(config["training"].get("transition_row_sum_floor", 0.0))
+        self.transition_row_sum_ceiling = float(config["training"].get("transition_row_sum_ceiling", 0.0))
         self.forecast_loss_horizon = int(config["training"].get("forecast_loss_horizon", 0))
         self.forecast_loss_min_context = int(config["training"].get("forecast_loss_min_context", 1))
         self.scheduled_sampling_ratio = float(config["training"].get("scheduled_sampling_start", 0.0))
@@ -212,9 +213,16 @@ class Stage2LagrangianStateSpaceModel(nn.Module):
                 rollout_rmse = torch.sqrt(torch.mean(rollout_error.square()).clamp_min(0.0))
 
         transition_row_sum_loss = zero
-        if self.transition_row_sum_weight > 0.0 and self.transition_row_sum_floor > 0.0:
+        if self.transition_row_sum_weight > 0.0:
             row_sum = outputs["transition_row_sum"].to(dtype=output_dtype)
-            transition_row_sum_loss = F.relu(self.transition_row_sum_floor - row_sum).square().mean()
+            if self.transition_row_sum_floor > 0.0:
+                transition_row_sum_loss = transition_row_sum_loss + F.relu(
+                    self.transition_row_sum_floor - row_sum
+                ).square().mean()
+            if self.transition_row_sum_ceiling > 0.0:
+                transition_row_sum_loss = transition_row_sum_loss + F.relu(
+                    row_sum - self.transition_row_sum_ceiling
+                ).square().mean()
 
         total_loss = (
             self.nll_weight * normalized_nll
